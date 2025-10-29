@@ -1,0 +1,88 @@
+# AI Generated Documentation
+ai_generated_docs/
+
+# Build artifacts
+obj/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+
+# Executables
+test_ringbuffer
+test_ssl
+test_ws
+test_binance_integration
+debug_test
+ssl_test_conn
+
+# Static library
+libws.a
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+.*.swp
+.*.swo
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.clangd/
+compile_commands.json
+
+# OS-specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Core dumps and debugging
+core
+core.*
+vgcore.*
+*.dSYM/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Backup files
+*.bak
+*.backup
+
+# CMake (if used in the future)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+
+# Dependency directories
+vendor/
+third_party/
+.deps/
+
+# Testing artifacts
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
+# Package files
+*.tar.gz
+*.zip
+*.tgz
+
+# Benchmark results
+benchmark_results/
+*.perf
+*.flamegraph
