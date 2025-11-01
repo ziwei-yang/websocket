@@ -50,5 +50,17 @@ uint64_t ssl_get_hw_timestamp(ssl_context_t *ctx);
 // When kTLS is enabled, encryption/decryption is offloaded to the kernel for better performance
 int ssl_ktls_enabled(ssl_context_t *ctx);
 
+// Get negotiated cipher suite name
+// Returns cipher name string (e.g., "ECDHE-RSA-AES128-GCM-SHA256"), or NULL if not connected
+const char* ssl_get_cipher_name(ssl_context_t *ctx);
+
+// Check if hardware cryptography acceleration is available
+// Returns 1 if AES-NI (x86) or ARM Crypto Extensions are available, 0 otherwise
+int ssl_has_hw_crypto(void);
+
+// Get SSL backend version string
+// Returns version string (e.g., "LibreSSL 3.8.2", "BoringSSL", "OpenSSL 3.0.0")
+const char* ssl_get_backend_version(void);
+
 #endif // SSL_H
 

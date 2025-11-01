@@ -9,6 +9,7 @@ Exchange Server → TCP/IP Socket → SSL/TLS → Ringbuffer -> HTTP/Websocket P
 - **TCP/IP Socket**: Uses socket.h to handle network traffic
 - **SSL/TLS**: Uses OpenSSL/LibreSSL/OpenSSL+kTLS(Linux only) library for handshaking and message encryption/decryption support.
 - **HTTP/Websocket**: Custom implementation (no external library) that parses HTTP 200 OK responses and extracts payload content
+	- Basic Websocket protocol features: automatically respond to **<89> PING frame**
 - **Event poll**: epoll on Linux, kqueue on macos
 
 ### Memory Model

@@ -11,6 +11,7 @@
 #include <time.h>
 #include <fcntl.h>
 
+// #define WS_DEBUG 1
 #define WS_HTTP_BUFFER_SIZE 4096
 
 typedef enum {
@@ -80,6 +81,11 @@ uint64_t ws_get_nic_timestamp(websocket_context_t *ws) {
 int ws_has_hw_timestamping(websocket_context_t *ws) {
     if (!ws) return 0;
     return ws->hw_timestamping_available;
+}
+
+const char* ws_get_cipher_name(websocket_context_t *ws) {
+    if (!ws || !ws->ssl) return NULL;
+    return ssl_get_cipher_name(ws->ssl);
 }
 
 int ws_get_rx_buffer_is_mirrored(websocket_context_t *ws) {
@@ -416,6 +422,42 @@ static inline void handle_http_stage(websocket_context_t *ws) {
     }
 }
 
+// Send PONG frame in response to PING (RFC 6455 Section 5.5.2)
+static inline void send_pong_frame(websocket_context_t *ws, const uint8_t *ping_payload, size_t ping_len) {
+    // PONG frame: FIN=1, opcode=0xA (PONG)
+    uint8_t frame[14];
+    size_t frame_len = 2;
+
+    frame[0] = 0x8A;  // FIN + PONG frame
+    frame[1] = ping_len & 0x7F;  // Payload length (control frames must be <= 125 bytes)
+
+    // Extended length for payloads > 125 bytes (rare for PING)
+    if (ping_len > 125) {
+        frame[1] = 126;
+        frame[2] = (ping_len >> 8) & 0xFF;
+        frame[3] = ping_len & 0xFF;
+        frame_len = 4;
+    }
+
+    size_t total_size = frame_len + ping_len;
+
+    // Write to TX buffer
+    uint8_t *write_ptr = NULL;
+    size_t available = 0;
+    ringbuffer_get_write_ptr(&ws->tx_buffer, &write_ptr, &available);
+
+    if (available >= total_size) {
+        // Write frame header + payload
+        memcpy(write_ptr, frame, frame_len);
+        if (ping_len > 0) {
+            memcpy(write_ptr + frame_len, ping_payload, ping_len);
+        }
+        ringbuffer_commit_write(&ws->tx_buffer, total_size);
+        ws->has_pending_tx = 1;
+    }
+    // If no space, silently drop (control frames are best-effort in tight loops)
+}
+
 // Handle WebSocket data stage - HFT hot path (assume always connected)
 static inline void handle_ws_stage(websocket_context_t *ws) {
     // Optimization #7: Cache available to avoid redundant ringbuffer_available_read() calls
@@ -429,9 +471,16 @@ static inline void handle_ws_stage(websocket_context_t *ws) {
 
         int consumed = parse_ws_frame_zero_copy(ws, available, &payload_ptr, &payload_len, &opcode);
         if (consumed > 0) {
+            // Handle PING frames automatically (RFC 6455: MUST respond with PONG)
+            if (opcode == WS_FRAME_PING) {
+                send_pong_frame(ws, payload_ptr, payload_len);
+            }
+
+            // Pass all frames to callback (application can see PINGs/PONGs for monitoring)
             if (ws->on_msg) {
                 ws->on_msg(ws, payload_ptr, payload_len, opcode);
             }
+
             // Update cached available by subtracting consumed bytes
             available -= consumed;
         } else {
@@ -457,6 +506,10 @@ int ws_update(websocket_context_t *ws) {
             if (ws->handshake_sent) {
                 handle_http_stage(ws);
             }
+        } else if (ssl_status == -1) {
+            // SSL handshake failed - notify application via status callback
+            if (ws->on_status) ws->on_status(ws, -1);
+            return -1;
         }
         return 0;
     }

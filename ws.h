@@ -64,6 +64,9 @@ uint64_t ws_get_nic_timestamp(websocket_context_t *ws);
 // Check if hardware timestamping is available (Linux only)
 int ws_has_hw_timestamping(websocket_context_t *ws);
 
+// Get SSL cipher name (returns NULL if not connected)
+const char* ws_get_cipher_name(websocket_context_t *ws);
+
 // Get ringbuffer status information
 int ws_get_rx_buffer_is_mirrored(websocket_context_t *ws);
 int ws_get_rx_buffer_is_mmap(websocket_context_t *ws);

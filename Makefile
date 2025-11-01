@@ -177,6 +177,11 @@ SSL_BENCHMARK_SRC = test/ssl_benchmark.c
 SSL_BENCHMARK_OBJ = $(OBJDIR)/ssl_benchmark.o
 SSL_BENCHMARK_EXE = ssl_benchmark
 
+# Simple Example
+EXAMPLE_SRC = example/simple_ws.c
+EXAMPLE_OBJ = $(OBJDIR)/simple_ws.o
+EXAMPLE_EXE = simple_ws_example
+
 # Integration Test executable
 $(INTEGRATION_TEST_OBJ): $(INTEGRATION_TEST_SRC) ws.h ssl.h ringbuffer.h | $(OBJDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $(INTEGRATION_TEST_SRC) -o $@
@@ -189,6 +194,13 @@ $(SSL_BENCHMARK_OBJ): $(SSL_BENCHMARK_SRC) ssl.h ssl_backend.h os.h | $(OBJDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $(SSL_BENCHMARK_SRC) -o $@
 
 $(SSL_BENCHMARK_EXE): $(SSL_BENCHMARK_OBJ) $(LIBRARY)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# Simple Example executable
+$(EXAMPLE_OBJ): $(EXAMPLE_SRC) ws.h ssl.h ws_notifier.h | $(OBJDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $(EXAMPLE_SRC) -o $@
+
+$(EXAMPLE_EXE): $(EXAMPLE_OBJ) $(LIBRARY)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Test executable
@@ -266,9 +278,18 @@ benchmark-ssl: $(OBJDIR) $(SSL_BENCHMARK_EXE)
 	@echo ""
 	./$(SSL_BENCHMARK_EXE)
 
+# Build simple example
+example-build: $(OBJDIR) $(EXAMPLE_EXE)
+
+# Build and run simple example
+example: $(OBJDIR) $(EXAMPLE_EXE)
+	@echo "Running simple WebSocket example..."
+	@echo ""
+	./$(EXAMPLE_EXE)
+
 # Clean build artifacts and PGO profiling data
 clean:
-	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(SSL_BENCHMARK_EXE)
+	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(SSL_BENCHMARK_EXE) $(EXAMPLE_EXE)
 	rm -f *.profraw *.profdata default.profdata default*.profraw
 
 # Debug build
@@ -387,7 +408,7 @@ integration-test-profile:
 
 # Clean only object files (keep profile data)
 clean-objs:
-	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(SSL_BENCHMARK_EXE)
+	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(SSL_BENCHMARK_EXE) $(EXAMPLE_EXE)
 
 # Clean everything including profile data
 clean-all: clean
@@ -451,12 +472,14 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  all             - Build library (default)"
+	@echo "  example         - Build and run simple WebSocket example"
 	@echo "  test            - Build and run all unit tests (requires cmocka)"
 	@echo "  integration-test - Build and run integration test (Binance WebSocket)"
 	@echo "  benchmark-ssl   - Build and run SSL backend benchmark"
 	@echo "  test-ringbuffer - Run ringbuffer tests only"
 	@echo "  test-ssl        - Run SSL tests only"
 	@echo "  test-ws         - Run WebSocket tests only"
+	@echo "  example-build   - Build simple example executable only"
 	@echo "  integration-test-build - Build integration test executable only"
 	@echo "  benchmark-ssl-build - Build SSL benchmark executable only"
 	@echo "  integration-test-profile - Automated PGO workflow (profile + optimize + compare)"
@@ -474,6 +497,7 @@ help:
 	@echo ""
 	@echo "Example usage:"
 	@echo "  make                # Build library"
+	@echo "  make example        # Build and run simple WebSocket example"
 	@echo "  make release        # Build optimized with LTO"
 	@echo "  make test           # Run all unit tests (requires cmocka)"
 	@echo "  make integration-test # Run integration test (with latency benchmarking)"
@@ -486,4 +510,4 @@ help:
 	@echo "  ./test_binance_integration  # Run representative workload"
 	@echo "  make profile-use            # Build optimized version"
 
-.PHONY: all clean install run-integration debug test-asan test-ubsan test-tsan release help install-deps test test-ringbuffer test-ssl test-ws integration-test integration-test-build benchmark-ssl benchmark-ssl-build integration-test-profile profile-generate profile-use clean-objs clean-all static-ssl
+.PHONY: all clean install run-integration debug test-asan test-ubsan test-tsan release help install-deps test test-ringbuffer test-ssl test-ws integration-test integration-test-build benchmark-ssl benchmark-ssl-build integration-test-profile profile-generate profile-use clean-objs clean-all static-ssl example example-build

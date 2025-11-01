@@ -203,6 +203,20 @@ int ssl_handshake(ssl_context_t *sctx) {
 
     SSL_set_fd(sctx->ssl, sctx->sockfd);
 
+    // Force AES-GCM cipher suites for hardware acceleration (configurable via WS_CIPHER_LIST)
+    const char *cipher_list = getenv("WS_CIPHER_LIST");
+    if (!cipher_list) {
+        // Default: Prioritize AES-GCM (hardware accelerated) over ChaCha20-Poly1305
+        cipher_list = "ECDHE-RSA-AES128-GCM-SHA256:"
+                      "ECDHE-RSA-AES256-GCM-SHA384:"
+                      "ECDHE-RSA-CHACHA20-POLY1305:"
+                      "AES128-GCM-SHA256:"
+                      "AES256-GCM-SHA384";
+    }
+    if (SSL_set_cipher_list(sctx->ssl, cipher_list) != 1) {
+        fprintf(stderr, "Warning: Failed to set cipher list: %s\n", cipher_list);
+    }
+
 #if defined(SSL_BACKEND_KTLS) && defined(KTLS_SUPPORTED)
     // Enable kTLS before handshake (OpenSSL will set it up automatically if supported)
     #ifdef SSL_OP_ENABLE_KTLS
@@ -377,4 +391,61 @@ const char *ssl_get_backend_name(void) {
 int ssl_ktls_enabled(ssl_context_t *sctx) {
     if (!sctx) return 0;
     return sctx->ktls_enabled;
+}
+
+// Get negotiated cipher suite name
+const char* ssl_get_cipher_name(ssl_context_t *sctx) {
+    if (!sctx || !sctx->ssl) return NULL;
+
+    const SSL_CIPHER *cipher = SSL_get_current_cipher(sctx->ssl);
+    if (!cipher) return NULL;
+
+    return SSL_CIPHER_get_name(cipher);
+}
+
+// Check if hardware cryptography acceleration is available
+int ssl_has_hw_crypto(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    // x86/x64: Check for AES-NI via CPUID
+    #if defined(__GNUC__) || defined(__clang__)
+    unsigned int eax, ebx, ecx, edx;
+
+    // CPUID function 1: Processor Info and Feature Bits
+    __asm__ __volatile__(
+        "cpuid"
+        : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx)
+        : "a" (1), "c" (0)
+    );
+
+    // Check ECX bit 25 for AES-NI support
+    return (ecx & (1 << 25)) != 0;
+    #else
+    return 0;  // Compiler doesn't support inline assembly
+    #endif
+
+#elif defined(__aarch64__) || defined(__arm64__)
+    // ARM64: Check for ARM Crypto Extensions at compile time
+    #ifdef __ARM_FEATURE_CRYPTO
+    return 1;  // ARM Crypto Extensions available
+    #else
+    return 0;  // No ARM Crypto Extensions
+    #endif
+
+#else
+    // Other architectures: assume no hardware crypto
+    return 0;
+#endif
+}
+
+// Get SSL backend version string
+const char* ssl_get_backend_version(void) {
+#if defined(SSL_BACKEND_LIBRESSL)
+    return "LibreSSL " LIBRESSL_VERSION_TEXT;
+#elif defined(SSL_BACKEND_BORINGSSL)
+    return "BoringSSL";
+#elif defined(SSL_BACKEND_OPENSSL)
+    return "OpenSSL " OPENSSL_VERSION_TEXT;
+#else
+    return "Unknown SSL Backend";
+#endif
 }

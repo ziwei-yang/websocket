@@ -1,5 +1,6 @@
 #include "../../ws.h"
 #include "../../ws_notifier.h"
+#include "../../ssl.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -581,6 +582,25 @@ int main(int argc, char *argv[]) {
                 running = 0;
             }
         }
+
+        // Print SSL configuration after successful connection
+        printf("\n🔐 SSL Configuration:\n");
+        const char *backend_version = ssl_get_backend_version();
+        printf("   Backend:               %s\n", backend_version ? backend_version : "Unknown");
+
+        const char *cipher_name = ws_get_cipher_name(ws);
+        printf("   Cipher Suite:          %s\n", cipher_name ? cipher_name : "Unknown");
+
+        int hw_crypto = ssl_has_hw_crypto();
+        printf("   Hardware Acceleration: %s", hw_crypto ? "YES" : "NO");
+        if (hw_crypto) {
+#if defined(__x86_64__) || defined(__i386__)
+            printf(" (AES-NI)");
+#elif defined(__aarch64__) || defined(__arm64__)
+            printf(" (ARM Crypto Extensions)");
+#endif
+        }
+        printf("\n\n");
     }
 
     // Main event loop - minimal hot path
