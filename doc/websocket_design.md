@@ -4,15 +4,16 @@ This library delivers high-performance WebSocket capabilities optimized for high
 
 ### Data Flow
 
-Exchange Server → TCP/IP Socket → SSL/TLS → HTTP Parser → Plain Text
+Exchange Server → TCP/IP Socket → SSL/TLS → Ringbuffer -> HTTP/Websocket Parser → on_msg()
 
 - **TCP/IP Socket**: Uses socket.h to handle network traffic
-- **SSL/TLS**: Uses OpenSSL library for handshaking and message encryption/decryption support
-- **HTTP Layer**: Custom implementation (no external library) that parses HTTP 200 OK responses and extracts payload content
+- **SSL/TLS**: Uses OpenSSL/LibreSSL/OpenSSL+kTLS(Linux only) library for handshaking and message encryption/decryption support.
+- **HTTP/Websocket**: Custom implementation (no external library) that parses HTTP 200 OK responses and extracts payload content
+- **Event poll**: epoll on Linux, kqueue on macos
 
 ### Memory Model
 
-- **Ring Buffer**: Pre-allocated 10MB ring buffer for receiving data from rx_queue and transmitting to tx_queue
+- **Ring Buffer**: Pre-allocated 8192KB ring buffer for receiving data from rx_queue and transmitting to tx_queue
 - **Zero-Copy Operations**: Both sending and consuming data within the ring buffer use offset-based operations with zero-copy semantics
   - Specifically: `ringbuffer_next_read(rb, *data, *len)` retrieves the next readable memory pointer and available content length. `ws_send()` is invoked with the address and offset in the tx_queue buffer directly. No in-stack `buffer[]` is used for data transmission.
 - **Single Producer-Consumer Model**: The ring buffer is designed for exactly one writer and one reader, eliminating contention. The SSL context is the sole writer, writing directly into the ring buffer via `SSL_read()`.
@@ -20,19 +21,18 @@ Exchange Server → TCP/IP Socket → SSL/TLS → HTTP Parser → Plain Text
 
 ### SSL/TLS Library Replaceable Design
 
-The `ssl.h` module provides an abstraction layer that wraps OpenSSL library methods, enabling future TLS performance enhancements or alternative implementations.
+The `ssl.h` module provides an abstraction layer that wraps OpenSSL standard methods, enabling future TLS performance enhancements or alternative implementations.
 
 This project prioritizes extreme performance, and security features that introduce latency can be omitted. Any steps that increase latency should be skipped. The library is intentionally thread-unsafe, with no threads or locks introduced to maximize performance.
 
 ### Code Structure
 
 ```
-ws.h
-ws.c
-ssl.h
-ssl.c
-ringbuffer.h
-ringbuffer.c
+ws.h/c
+ssl.h/c
+ringbuffer.h/c
+ws_notifier.h/c # Event machine
+os.h/c # OS API: cpu cycle, etc.
 test/ws_test.c
 test/ssl_test.c
 test/ringbuffer_test.c
@@ -56,6 +56,7 @@ test/integration/binance.c
 
 #### Latency Measurement
 - Record CPU cycle count when the message arrives at the socket layer
+- Record CPU cycle count when the message decrypted after the ssl_read()
 - Record CPU cycle count when the message appears in user-space memory
 - Calculate processing latency by comparing these timestamps
 

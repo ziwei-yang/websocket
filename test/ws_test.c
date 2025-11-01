@@ -182,9 +182,9 @@ void test_send_message() {
 void test_cpu_cycles() {
     printf("\n=== Testing CPU Cycle Counting ===\n");
     
-    uint64_t cycle1 = ws_get_cpu_cycle();
+    uint64_t cycle1 = os_get_cpu_cycle();
     usleep(1000); // Sleep 1ms
-    uint64_t cycle2 = ws_get_cpu_cycle();
+    uint64_t cycle2 = os_get_cpu_cycle();
     
     TEST("CPU cycle counting works", cycle2 > cycle1);
     TEST("CPU cycles increase over time", (cycle2 - cycle1) > 0);
@@ -243,15 +243,15 @@ void test_performance() {
         // Test CPU cycle counting performance
         const int num_iterations = 1000;
         
-        uint64_t start_cycle = ws_get_cpu_cycle();
+        uint64_t start_cycle = os_get_cpu_cycle();
         
         for (int i = 0; i < num_iterations; i++) {
             // Just test the cycle counting overhead
-            uint64_t cycle = ws_get_cpu_cycle();
+            uint64_t cycle = os_get_cpu_cycle();
             (void)cycle; // Avoid unused variable warning
         }
         
-        uint64_t end_cycle = ws_get_cpu_cycle();
+        uint64_t end_cycle = os_get_cpu_cycle();
         uint64_t cycles_per_iteration = (end_cycle - start_cycle) / num_iterations;
         
         TEST("Performance test completed", cycles_per_iteration > 0);

@@ -45,12 +45,13 @@ void ws_close(websocket_context_t *ws);
 // Get connection state
 ws_state_t ws_get_state(websocket_context_t *ws);
 
-// Get CPU cycle for benchmark
-uint64_t ws_get_cpu_cycle(void);
-
-// Get timestamp when data was last received from socket
+// Get timestamp when data was last received from socket (NIC arrival or start of recv)
 // Use this to measure socket-to-callback latency
 uint64_t ws_get_last_recv_timestamp(websocket_context_t *ws);
+
+// Get timestamp when SSL_read completed (data decrypted and in userspace)
+// Use this to measure SSL decryption time separately from application processing
+uint64_t ws_get_ssl_read_timestamp(websocket_context_t *ws);
 
 // Get socket file descriptor for select/poll/epoll
 // Returns -1 on error
@@ -63,42 +64,15 @@ uint64_t ws_get_nic_timestamp(websocket_context_t *ws);
 // Check if hardware timestamping is available (Linux only)
 int ws_has_hw_timestamping(websocket_context_t *ws);
 
-// Batch processing configuration and statistics
-// Set maximum messages to process per ws_update() call (0 = unlimited)
-void ws_set_max_batch_size(websocket_context_t *ws, size_t max_size);
+// Get ringbuffer status information
+int ws_get_rx_buffer_is_mirrored(websocket_context_t *ws);
+int ws_get_rx_buffer_is_mmap(websocket_context_t *ws);
+int ws_get_tx_buffer_is_mirrored(websocket_context_t *ws);
+int ws_get_tx_buffer_is_mmap(websocket_context_t *ws);
 
-// Get last batch size (messages processed in last ws_update())
-size_t ws_get_last_batch_size(websocket_context_t *ws);
-
-// Get maximum batch size seen (peak messages in single ws_update())
-size_t ws_get_max_batch_size(websocket_context_t *ws);
-
-// Get total number of batches processed
-size_t ws_get_total_batches(websocket_context_t *ws);
-
-// Get average batch size (total_messages / total_batches)
-double ws_get_avg_batch_size(websocket_context_t *ws);
-
-// CPU Affinity and Real-Time Priority Utilities
-// These functions configure the calling thread for optimal performance
-
-// Pin calling thread to specific CPU core (0-indexed)
-// Returns 0 on success, -1 on failure
-// Platform support: Linux (full), macOS (best-effort), others (no-op)
-int ws_set_thread_affinity(int cpu_id);
-
-// Set real-time scheduling priority for calling thread
-// priority: 1-99 (higher = more urgent), 0 = normal scheduling
-// Returns 0 on success, -1 on failure
-// Requires: Linux (CAP_SYS_NICE or root), macOS (root), others (no-op)
-// Policy: SCHED_FIFO on Linux, SCHED_RR fallback
-int ws_set_thread_realtime_priority(int priority);
-
-// Get current thread's CPU affinity (-1 if not set or unsupported)
-int ws_get_thread_affinity(void);
-
-// Get current thread's real-time priority (0 if not RT, -1 if error)
-int ws_get_thread_realtime_priority(void);
+// Include OS utilities for CPU affinity and real-time priority
+// Use os_* functions directly for thread configuration
+#include "os.h"
 
 #endif // WS_H
 

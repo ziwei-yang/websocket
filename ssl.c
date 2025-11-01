@@ -1,8 +1,10 @@
 #include "ssl.h"
+#include "ssl_backend.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -15,6 +17,12 @@
 #include <linux/net_tstamp.h>
 #include <linux/errqueue.h>
 #define HW_TIMESTAMPING_SUPPORTED 1
+// Linux kTLS support (requires kernel 4.13+ for RX, 4.17+ for TX)
+#include <linux/tls.h>
+#ifndef TCP_ULP
+#define TCP_ULP 31
+#endif
+#define KTLS_SUPPORTED 1
 #endif
 
 // Static global context for thread-unsafe but fast operations
@@ -59,6 +67,8 @@ struct ssl_context {
     uint32_t magic;
     // Hardware timestamping enabled flag (Linux only)
     int hw_timestamping_enabled;
+    // kTLS enabled flag (Linux only, offloads crypto to kernel)
+    int ktls_enabled;
 };
 
 #define SSL_CONTEXT_MAGIC 0x53534C00  // "SSL\0" in little-endian
@@ -80,6 +90,7 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     sctx->sockfd = -1;
     sctx->magic = SSL_CONTEXT_MAGIC;  // Set magic value
     sctx->hw_timestamping_enabled = 0;  // Will be set if successful
+    sctx->ktls_enabled = 0;  // Will be set if kTLS is enabled
 
     // Create socket
     struct hostent *server = gethostbyname(hostname);
@@ -99,6 +110,34 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     // Set non-blocking mode
     int flags = fcntl(sctx->sockfd, F_GETFL, 0);
     fcntl(sctx->sockfd, F_SETFL, flags | O_NONBLOCK);
+
+    // Optimize socket buffer sizes for low latency
+    // Larger buffers reduce the chance of drops but may increase latency
+    // For HFT, we prefer smaller buffers with faster processing
+    int rcvbuf_size = 256 * 1024;  // 256KB receive buffer
+    int sndbuf_size = 256 * 1024;  // 256KB send buffer
+
+    setsockopt(sctx->sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+    setsockopt(sctx->sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
+
+    // Enable TCP_NODELAY to disable Nagle's algorithm (reduce latency)
+    int nodelay = 1;
+    setsockopt(sctx->sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    // Enable SO_KEEPALIVE to detect dead connections
+    int keepalive = 1;
+    setsockopt(sctx->sockfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+
+#ifdef __APPLE__
+    // macOS-specific socket optimizations
+    // Set TCP_NOOPT to disable TCP options processing for lower latency
+    int tcp_noopt = 1;
+    setsockopt(sctx->sockfd, IPPROTO_TCP, TCP_NOOPT, &tcp_noopt, sizeof(tcp_noopt));
+
+    // Set SO_NOSIGPIPE to prevent SIGPIPE on broken connections
+    int nosigpipe = 1;
+    setsockopt(sctx->sockfd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+#endif
 
 #ifdef HW_TIMESTAMPING_SUPPORTED
     // Enable hardware timestamping on Linux
@@ -161,8 +200,15 @@ int ssl_handshake(ssl_context_t *sctx) {
     
     sctx->ssl = SSL_new(global_ctx);
     if (!sctx->ssl) return -1;
-    
+
     SSL_set_fd(sctx->ssl, sctx->sockfd);
+
+#if defined(SSL_BACKEND_KTLS) && defined(KTLS_SUPPORTED)
+    // Enable kTLS before handshake (OpenSSL will set it up automatically if supported)
+    #ifdef SSL_OP_ENABLE_KTLS
+    SSL_set_options(sctx->ssl, SSL_OP_ENABLE_KTLS);
+    #endif
+#endif
     
     // Check if socket is connected
     int optval;
@@ -179,22 +225,46 @@ int ssl_handshake(ssl_context_t *sctx) {
         }
         return -1;  // Handshake failed
     }
-    
+
+#if defined(SSL_BACKEND_KTLS) && defined(KTLS_SUPPORTED)
+    // Enable Kernel TLS after successful handshake (Linux only)
+    // OpenSSL 3.0+ and 1.1.1+ have built-in kTLS support
+    // Check if kTLS was successfully enabled by OpenSSL
+
+    #if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    // OpenSSL 3.0+ API
+    if (BIO_get_ktls_send(SSL_get_wbio(sctx->ssl)) &&
+        BIO_get_ktls_recv(SSL_get_rbio(sctx->ssl))) {
+        sctx->ktls_enabled = 1;
+    }
+    #elif OPENSSL_VERSION_NUMBER >= 0x10101000L
+    // OpenSSL 1.1.1+ API (BIO_get_ktls_send/recv may not be available)
+    // Try to check if kTLS is enabled via socket options
+    int ulp_enabled = 0;
+    socklen_t optlen = sizeof(ulp_enabled);
+    if (getsockopt(sctx->sockfd, SOL_TCP, TCP_ULP, &ulp_enabled, &optlen) == 0) {
+        sctx->ktls_enabled = 1;
+    }
+    #endif
+
+    // If kTLS is not enabled, we continue with userspace OpenSSL (graceful fallback)
+#endif
+
     return 1;  // Handshake completed successfully
 }
 
 int ssl_send(ssl_context_t *sctx, const uint8_t *data, size_t len) {
-    if (!sctx || !sctx->ssl) return -1;
-    
+    if (__builtin_expect(!sctx || !sctx->ssl, 0)) return -1;  // Unlikely: validation
+
     int result = SSL_write(sctx->ssl, data, len);
-    if (result <= 0) {
+    if (__builtin_expect(result <= 0, 0)) {  // Unlikely: error path
         int err = SSL_get_error(sctx->ssl, result);
         if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
             return 0; // Would block, not an error
         }
         return -1;
     }
-    
+
     return result;
 }
 
@@ -296,4 +366,15 @@ uint64_t ssl_get_hw_timestamp(ssl_context_t *sctx) {
 #else
     return 0;
 #endif
+}
+
+// Get backend name at runtime
+const char *ssl_get_backend_name(void) {
+    return SSL_BACKEND_NAME;
+}
+
+// Check if Kernel TLS is enabled
+int ssl_ktls_enabled(ssl_context_t *sctx) {
+    if (!sctx) return 0;
+    return sctx->ktls_enabled;
 }

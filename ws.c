@@ -1,55 +1,15 @@
-// Define _GNU_SOURCE before any includes for Linux
-#ifdef __linux__
-#define _GNU_SOURCE
-#endif
-
 #include "ws.h"
 #include "ssl.h"
 #include "ringbuffer.h"
+#include "os.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <unistd.h>
-#include <time.h>
-#include <pthread.h>
 #include <errno.h>
-
-// Platform-specific includes for CPU affinity and real-time priority
-#ifdef __linux__
-#include <sched.h>
-#include <sys/types.h>
-#define HAS_CPU_AFFINITY 1
-#define HAS_RT_PRIORITY 1
-#elif defined(__APPLE__)
-#include <mach/thread_policy.h>
-#include <mach/thread_act.h>
-#include <mach/mach_init.h>
-#define HAS_CPU_AFFINITY 1  // Best-effort via thread affinity tags
-#define HAS_RT_PRIORITY 1   // Via pthread_setschedparam
-#else
-#define HAS_CPU_AFFINITY 0
-#define HAS_RT_PRIORITY 0
-#endif
-// Use RDTSC instruction for CPU cycle counting
-#if defined(__i386__) || defined(__x86_64__)
-# include <x86intrin.h>
-static inline uint64_t rdtsc(void) {
-    return __rdtsc();
-}
-#elif defined(__aarch64__)
-static inline uint64_t rdtsc(void) {
-    uint64_t val;
-    __asm__ volatile("mrs %0, cntvct_el0" : "=r" (val));
-    return val;
-}
-#else
-static inline uint64_t rdtsc(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-#endif
+#include <time.h>
+#include <fcntl.h>
 
 #define WS_HTTP_BUFFER_SIZE 4096
 
@@ -67,48 +27,44 @@ struct websocket_context {
     ringbuffer_t rx_buffer;
     ringbuffer_t tx_buffer;
     ws_on_msg_t on_msg;          // Zero-copy callback
-    ws_on_status_t on_status;
-    ws_state_t state;
-    
+    ws_on_status_t on_status;    // Connection status callback (called once on connect)
+
+    // Connection state: 0 = connecting, 1 = connected
+    int connected;
+    int closed;  // Set to 1 when ws_close() is called
+
     // URL parsing
     char *hostname;
     int port;
     char *path;
-    
-    // HTTP state
+
+    // HTTP state (used only during initial handshake)
     uint8_t http_buffer[WS_HTTP_BUFFER_SIZE];
     size_t http_len;
-    
-    // Statistics
-    uint64_t connect_time_cycle;
-    uint64_t first_msg_cycle;
-    size_t total_messages;
+    int handshake_sent;
 
-    // Latency measurement - timestamp when data last received from socket
+    // Latency measurement - timestamp when data last received from socket (NIC arrival)
     uint64_t last_recv_timestamp;
+
+    // Timestamp when SSL_read completed (data decrypted and in userspace)
+    uint64_t ssl_read_complete_timestamp;
+
+    // Optimization #8: Flag to avoid checking tx_buffer when empty (receive-only workload)
+    uint8_t has_pending_tx;
 
     // Hardware NIC timestamp (Linux only, in nanoseconds)
     uint64_t last_nic_timestamp;
     int hw_timestamping_available;
-
-    // Batch processing statistics
-    size_t total_batches;
-    size_t last_batch_size;
-    size_t max_batch_size;
-    size_t max_messages_per_update;  // 0 = unlimited
 };
-
-static uint64_t get_cpu_cycle(void) {
-    return rdtsc();
-}
-
-uint64_t ws_get_cpu_cycle(void) {
-    return get_cpu_cycle();
-}
 
 uint64_t ws_get_last_recv_timestamp(websocket_context_t *ws) {
     if (!ws) return 0;
     return ws->last_recv_timestamp;
+}
+
+uint64_t ws_get_ssl_read_timestamp(websocket_context_t *ws) {
+    if (!ws) return 0;
+    return ws->ssl_read_complete_timestamp;
 }
 
 int ws_get_fd(websocket_context_t *ws) {
@@ -126,29 +82,24 @@ int ws_has_hw_timestamping(websocket_context_t *ws) {
     return ws->hw_timestamping_available;
 }
 
-void ws_set_max_batch_size(websocket_context_t *ws, size_t max_size) {
-    if (!ws) return;
-    ws->max_messages_per_update = max_size;
-}
-
-size_t ws_get_last_batch_size(websocket_context_t *ws) {
+int ws_get_rx_buffer_is_mirrored(websocket_context_t *ws) {
     if (!ws) return 0;
-    return ws->last_batch_size;
+    return ringbuffer_is_mirrored(&ws->rx_buffer);
 }
 
-size_t ws_get_max_batch_size(websocket_context_t *ws) {
+int ws_get_rx_buffer_is_mmap(websocket_context_t *ws) {
     if (!ws) return 0;
-    return ws->max_batch_size;
+    return ringbuffer_is_mmap(&ws->rx_buffer);
 }
 
-size_t ws_get_total_batches(websocket_context_t *ws) {
+int ws_get_tx_buffer_is_mirrored(websocket_context_t *ws) {
     if (!ws) return 0;
-    return ws->total_batches;
+    return ringbuffer_is_mirrored(&ws->tx_buffer);
 }
 
-double ws_get_avg_batch_size(websocket_context_t *ws) {
-    if (!ws || ws->total_batches == 0) return 0.0;
-    return (double)ws->total_messages / (double)ws->total_batches;
+int ws_get_tx_buffer_is_mmap(websocket_context_t *ws) {
+    if (!ws) return 0;
+    return ringbuffer_is_mmap(&ws->tx_buffer);
 }
 
 // Base64 encoding for WebSocket key (simplified)
@@ -169,22 +120,47 @@ static void base64_encode(const uint8_t *input, char *output, size_t len) {
     output[out_len] = '\0';
 }
 
-// Generate WebSocket key
+// Generate cryptographically secure WebSocket key (RFC 6455 Section 10.3)
 static void generate_ws_key(char *key) {
     uint8_t random_bytes[16];
-    for (int i = 0; i < 16; i++) {
-        random_bytes[i] = rand() & 0xFF;
+    int success = 0;
+
+    // Try /dev/urandom first (cryptographically secure on Unix-like systems)
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t bytes_read = read(fd, random_bytes, 16);
+        close(fd);
+        if (bytes_read == 16) {
+            success = 1;
+        }
     }
+
+    // Fallback: Use rand() with proper seeding (less secure but better than nothing)
+    if (!success) {
+        static int rand_initialized = 0;
+        if (!rand_initialized) {
+            srand((unsigned int)(time(NULL) ^ getpid()));
+            rand_initialized = 1;
+        }
+        for (int i = 0; i < 16; i++) {
+            random_bytes[i] = rand() & 0xFF;
+        }
+    }
+
     base64_encode(random_bytes, key, 16);
 }
 
 // Parse URL
 static int parse_url(const char *url, char **hostname, int *port, char **path) {
     // Simple URL parser for wss:// and ws://
+    int default_port;
+
     if (strncmp(url, "wss://", 6) == 0) {
         url += 6;
+        default_port = 443;
     } else if (strncmp(url, "ws://", 5) == 0) {
         url += 5;
+        default_port = 80;
     } else {
         return -1;
     }
@@ -210,11 +186,12 @@ static int parse_url(const char *url, char **hostname, int *port, char **path) {
         *hostname = malloc(hostname_len + 1);
         strncpy(*hostname, url, hostname_len);
         (*hostname)[hostname_len] = '\0';
-        
+
+        *port = default_port;  // Use scheme-specific default
         *path = strdup(slash);
     } else {
         *hostname = strdup(url);
-        *port = 443;  // Default for wss://
+        *port = default_port;  // Use scheme-specific default
         *path = strdup("/");
     }
     
@@ -222,9 +199,12 @@ static int parse_url(const char *url, char **hostname, int *port, char **path) {
 }
 
 websocket_context_t *ws_init(const char *url) {
-    websocket_context_t *ws = (websocket_context_t *)malloc(sizeof(websocket_context_t));
-    if (!ws) return NULL;
-    
+    // Allocate with cache-line alignment for optimal performance
+    websocket_context_t *ws = NULL;
+    if (posix_memalign((void**)&ws, CACHE_LINE_SIZE, sizeof(websocket_context_t)) != 0) {
+        return NULL;
+    }
+
     memset(ws, 0, sizeof(websocket_context_t));
     
     // Parse URL
@@ -259,16 +239,10 @@ websocket_context_t *ws_init(const char *url) {
         return NULL;
     }
 
-    ws->state = WS_STATE_CONNECTING;
-    ws->connect_time_cycle = get_cpu_cycle();
+    ws->connected = 0;
+    ws->handshake_sent = 0;
     ws->hw_timestamping_available = ssl_hw_timestamping_enabled(ws->ssl);
     ws->last_nic_timestamp = 0;
-
-    // Initialize batch processing statistics
-    ws->total_batches = 0;
-    ws->last_batch_size = 0;
-    ws->max_batch_size = 0;
-    ws->max_messages_per_update = 0;  // 0 = unlimited (process all available)
 
     return ws;
 }
@@ -338,33 +312,23 @@ static int parse_http_response(websocket_context_t *ws) {
     return 1;  // Handshake complete
 }
 
-// Zero-copy WebSocket frame parser - returns payload pointer and length directly
-static int parse_ws_frame_zero_copy(websocket_context_t *ws, uint8_t **payload_ptr, size_t *payload_len, uint8_t *opcode) {
-    size_t available = ringbuffer_available_read(&ws->rx_buffer);
-    
-    if (available < 2) return 0;  // Not enough data
-    
+// Zero-copy WebSocket frame parser - HFT simplified version
+// Assumes: well-formed frames, FIN=1, no masking, complete frames in buffer
+// Optimization #7: Accept cached available to avoid redundant ringbuffer_available_read()
+static int parse_ws_frame_zero_copy(websocket_context_t *ws, size_t available, uint8_t **payload_ptr, size_t *payload_len, uint8_t *opcode) {
+    if (available < 2) return 0;
+
     // Get direct pointer to ringbuffer data (zero-copy)
     uint8_t *data_ptr = NULL;
     size_t data_len = 0;
     ringbuffer_peek_read(&ws->rx_buffer, &data_ptr, &data_len);
-    
     if (data_len < 2) return 0;
-    
-    // Parse frame header directly from ringbuffer memory
-    uint8_t fin = (data_ptr[0] >> 7) & 0x01;
+
+    // Parse frame header - assume FIN=1, well-formed
     *opcode = data_ptr[0] & 0x0F;
-    // uint8_t mask = (data_ptr[1] >> 7) & 0x01; // Not used for performance
     uint64_t payload_len_raw = data_ptr[1] & 0x7F;
-    
-    // Skip security checks for maximum performance - accept all frames
-    // Only require FIN bit for simplicity
-    if (!fin) {
-        return 0;  // Not a complete frame yet
-    }
-    
     size_t header_len = 2;
-    
+
     // Parse extended payload length
     if (payload_len_raw == 126) {
         if (data_len < 4) return 0;
@@ -378,417 +342,228 @@ static int parse_ws_frame_zero_copy(websocket_context_t *ws, uint8_t **payload_p
                           ((uint64_t)data_ptr[8] << 8) | data_ptr[9];
         header_len = 10;
     }
-    
-    // Check if we have enough data for the complete frame
-    if (data_len < header_len + payload_len_raw) {
-        return 0;  // Not enough data for complete frame
-    }
-    
-    // Return direct pointer to payload data (zero-copy!)
+
+    // Check if complete frame is available
+    if (data_len < header_len + payload_len_raw) return 0;
+
+    // Return direct pointer to payload (zero-copy)
     *payload_ptr = data_ptr + header_len;
     *payload_len = payload_len_raw;
-    
-    // Advance ringbuffer read position past the entire frame
+
+    // Prefetch payload data for large messages
+    if (payload_len_raw > CACHE_LINE_SIZE) {
+        __builtin_prefetch(*payload_ptr + CACHE_LINE_SIZE, 0, 2);
+        if (payload_len_raw > 512) {
+            __builtin_prefetch(*payload_ptr + 256, 0, 1);
+            __builtin_prefetch(*payload_ptr + 512, 0, 0);
+        }
+    }
+
+    // Advance ringbuffer past the frame
     ringbuffer_advance_read(&ws->rx_buffer, header_len + payload_len_raw);
-    
-    return 1;  // Frame parsed successfully
+
+    // Return actual bytes consumed (header + payload) for cache tracking
+    return (int)(header_len + payload_len_raw);
 }
 
 // Process incoming data - zero-copy from SSL to ring buffer
-static int process_recv(websocket_context_t *ws) {
+// HFT simplified: drains SSL, no error handling (fail-fast)
+static inline int process_recv(websocket_context_t *ws) {
+    // Capture NIC arrival timestamp (or start of recv)
+    ws->last_recv_timestamp = os_get_cpu_cycle();
+
     uint8_t *write_ptr = NULL;
     size_t write_len = 0;
+    int total_read = 0;
+    int first_read = 1;  // Track first successful read to capture SSL completion time
 
-    // Get write pointer from ring buffer
-    ringbuffer_get_write_ptr(&ws->rx_buffer, &write_ptr, &write_len);
-
-    if (write_len == 0) return 0;
-
-    // Read directly from SSL into ring buffer (zero-copy)
-    int ret = ssl_read_into(ws->ssl, write_ptr, write_len);
-
-    if (ret > 0) {
-        // Capture timestamp immediately when data received from socket
-        ws->last_recv_timestamp = get_cpu_cycle();
-        ringbuffer_commit_write(&ws->rx_buffer, ret);
-        return ret;
-    } else if (ret == 0) {
-        ws->state = WS_STATE_CLOSED;
-        return 0;
-    } else if (ret < 0) {
-        int err = ssl_get_error_code(ws->ssl, ret);
-        // Don't treat want read/write as errors (SSL_ERROR_WANT_READ=2, SSL_ERROR_WANT_WRITE=3)
-        if (err != 2 && err != 3 && err != 0) {
-            ws->state = WS_STATE_ERROR;
-            if (ws->on_status) ws->on_status(ws, -1);
-        }
-        return ret;
-    }
-    
-    return ret;
-}
-
-// Handle HTTP/WebSocket state machine
-static void handle_http_stage(websocket_context_t *ws) {
-    // Move HTTP data from SSL to ring buffer
-    uint8_t buffer[4096];
-    int ret = ssl_recv(ws->ssl, buffer, sizeof(buffer));
-    
-    if (ret > 0) {
-        memcpy(ws->http_buffer + ws->http_len, buffer, ret);
-        ws->http_len += ret;
-        
-        if (ws->http_len >= sizeof(ws->http_buffer)) {
-            ws->state = WS_STATE_ERROR;
-            if (ws->on_status) ws->on_status(ws, -1);
-            return;
-        }
-        
-        int http_result = parse_http_response(ws);
-        if (http_result == 1) {
-            ws->state = WS_STATE_CONNECTED;
-            if (ws->on_status) ws->on_status(ws, 0);
-            ws->first_msg_cycle = get_cpu_cycle();
-        } else if (http_result < 0) {
-            ws->state = WS_STATE_ERROR;
-            if (ws->on_status) ws->on_status(ws, -1);
-        }
-    }
-}
-
-// Handle WebSocket data stage with zero-copy parsing and batched processing
-static void handle_ws_stage(websocket_context_t *ws) {
-    // Exhaustive read loop - read from SSL until socket is empty (WANT_READ)
-    // This ensures we process all available data in a single ws_update() call
-    int read_result;
+    // Optimization: Use do-while to save one ssl_pending() call
+    // Since we're called when event notifier reports data available,
+    // we know there's data to read, so do at least one attempt
     do {
-        read_result = process_recv(ws);
-    } while (read_result > 0);  // Continue until no more data available
+        ringbuffer_get_write_ptr(&ws->rx_buffer, &write_ptr, &write_len);
+        if (write_len == 0) break;  // Ringbuffer full
 
-    // Track batch size for this update
-    size_t batch_size = 0;
-
-    // Parse frames using zero-copy approach
-    while (ringbuffer_available_read(&ws->rx_buffer) >= 2) {
-        // Check if we've hit the batch size limit
-        if (ws->max_messages_per_update > 0 && batch_size >= ws->max_messages_per_update) {
-            break;  // Batch limit reached, leave remaining messages for next update
+        int ret = ssl_read_into(ws->ssl, write_ptr, write_len);
+        if (ret > 0) {
+            // Capture timestamp after first successful SSL_read (data decrypted and in userspace)
+            if (first_read) {
+                ws->ssl_read_complete_timestamp = os_get_cpu_cycle();
+                first_read = 0;
+            }
+            ringbuffer_commit_write(&ws->rx_buffer, ret);
+            total_read += ret;
+        } else {
+            break;  // No more data available or error
         }
+    } while (ssl_pending(ws->ssl) > 0);  // Continue if SSL has buffered data
 
+    return total_read;
+}
+
+// Handle HTTP handshake - simplified
+static inline void handle_http_stage(websocket_context_t *ws) {
+    size_t space_available = sizeof(ws->http_buffer) - ws->http_len;
+    if (space_available == 0) return;  // Buffer full, wait
+
+    int ret = ssl_recv(ws->ssl, ws->http_buffer + ws->http_len, space_available);
+    if (ret > 0) {
+        ws->http_len += ret;
+        if (parse_http_response(ws) == 1) {
+            ws->connected = 1;
+            if (ws->on_status) ws->on_status(ws, 0);
+        }
+    }
+}
+
+// Handle WebSocket data stage - HFT hot path (assume always connected)
+static inline void handle_ws_stage(websocket_context_t *ws) {
+    // Optimization #7: Cache available to avoid redundant ringbuffer_available_read() calls
+    size_t available = ringbuffer_available_read(&ws->rx_buffer);
+
+    // Parse frames zero-copy
+    while (available >= 2) {
         uint8_t *payload_ptr = NULL;
         size_t payload_len = 0;
         uint8_t opcode = 0;
 
-        int result = parse_ws_frame_zero_copy(ws, &payload_ptr, &payload_len, &opcode);
-
-        if (result > 0) {
-            if (!ws->first_msg_cycle) {
-                ws->first_msg_cycle = get_cpu_cycle();
-            }
-            ws->total_messages++;
-            batch_size++;
-
-            // Call zero-copy callback
+        int consumed = parse_ws_frame_zero_copy(ws, available, &payload_ptr, &payload_len, &opcode);
+        if (consumed > 0) {
             if (ws->on_msg) {
                 ws->on_msg(ws, payload_ptr, payload_len, opcode);
             }
-
-            // Handle control frames
-            if (opcode == WS_FRAME_CLOSE) {
-                ws->state = WS_STATE_CLOSED;
-                break;
-            }
-        } else if (result < 0) {
-            break;  // Error
+            // Update cached available by subtracting consumed bytes
+            available -= consumed;
         } else {
-            break;  // Not enough data
-        }
-    }
-
-    // Update batch statistics
-    if (batch_size > 0) {
-        ws->total_batches++;
-        ws->last_batch_size = batch_size;
-        if (batch_size > ws->max_batch_size) {
-            ws->max_batch_size = batch_size;
+            break;  // No more complete frames
         }
     }
 }
 
+// HFT simplified ws_update: minimal state machine
 int ws_update(websocket_context_t *ws) {
     if (!ws) return -1;
-    
-    if (ws->state == WS_STATE_CONNECTING) {
-        int handshake_result = ssl_handshake(ws->ssl);
-        if (handshake_result == 1) {
-            // Handshake completed successfully
-            ws->state = WS_STATE_HANDSHAKING;
-            ws->http_len = 0;
-        } else if (handshake_result < 0) {
-            // Handshake failed
-            ws->state = WS_STATE_ERROR;
-            if (ws->on_status) ws->on_status(ws, -1);
-            return -1;
-        }
-        // If handshake_result == 0, handshake is still in progress, continue
-    } else if (ws->state == WS_STATE_HANDSHAKING) {
-        static int handshake_sent = 0;
-        
-        // Send handshake if not sent yet
-        if (!handshake_sent) {
-            int send_result = send_handshake(ws);
-            if (send_result > 0) {
-                handshake_sent = 1;
-            } else if (send_result < 0) {
-                ws->state = WS_STATE_ERROR;
-                return -1;
+
+    if (__builtin_expect(!ws->connected, 0)) { // Once per connection
+        // Connection phase - do SSL handshake and WebSocket handshake
+        int ssl_status = ssl_handshake(ws->ssl);
+        if (ssl_status == 1) {
+            // SSL handshake complete, send WebSocket handshake
+            if (!ws->handshake_sent) {
+                if (send_handshake(ws) > 0) {
+                    ws->handshake_sent = 1;
+                }
             }
-            // If send_result == 0, would block, try again next time
+            if (ws->handshake_sent) {
+                handle_http_stage(ws);
+            }
         }
-        
-        handle_http_stage(ws);
-    } else if (ws->state == WS_STATE_CONNECTED) {
-        handle_ws_stage(ws);
-        
-        // Send pending data
-        if (ringbuffer_available_read(&ws->tx_buffer) > 0) {
-            uint8_t send_buf[4096];
-            size_t to_send = ringbuffer_read(&ws->tx_buffer, send_buf, sizeof(send_buf));
-            ssl_send(ws->ssl, send_buf, to_send);
+        return 0;
+    }
+
+    // Hot path
+    // Drain SSL
+    process_recv(ws);
+    handle_ws_stage(ws);
+
+    // Optimization #8: Only check TX buffer if flag indicates pending data
+    if (__builtin_expect(ws->has_pending_tx, 0)) {
+        size_t tx_available = ringbuffer_available_read(&ws->tx_buffer);
+        if (tx_available > 0) {
+            uint8_t *read_ptr = NULL;
+            size_t read_len = 0;
+            ringbuffer_next_read(&ws->tx_buffer, &read_ptr, &read_len);
+            if (read_len > 0) {
+                if (read_len > 4096) read_len = 4096;
+                int sent = ssl_send(ws->ssl, read_ptr, read_len);
+                if (sent > 0) {
+                    ringbuffer_advance_read(&ws->tx_buffer, sent);
+                }
+            }
+        }
+        // Clear flag if TX buffer is now empty
+        if (ringbuffer_available_read(&ws->tx_buffer) == 0) {
+            ws->has_pending_tx = 0;
         }
     }
-    
+
     return 0;
 }
 
 int ws_send(websocket_context_t *ws, const uint8_t *data, size_t len) {
-    if (!ws || ws->state != WS_STATE_CONNECTED) return -1;
-    
-    // Create WebSocket frame
+    if (__builtin_expect(!ws || !ws->connected, 0)) return -1;  // Unlikely: validation
+
+    // Create WebSocket frame header
     uint8_t frame[14];
     size_t frame_len = 2;
-    
+
     frame[0] = 0x81;  // FIN + TEXT frame
     frame[1] = len & 0x7F;
-    
-    if (len > 125) {
+
+    // Likely: market data and typical messages are >125 bytes
+    if (__builtin_expect(len > 125, 1)) {
         // Extended payload length
         frame[1] = 126;
         frame[2] = (len >> 8) & 0xFF;
         frame[3] = len & 0xFF;
         frame_len = 4;
     }
-    
-    ringbuffer_write(&ws->tx_buffer, frame, frame_len);
-    ringbuffer_write(&ws->tx_buffer, data, len);
-    
+
+    size_t total_size = frame_len + len;
+
+    // Zero-copy write: get direct pointer and write in one shot
+    uint8_t *write_ptr = NULL;
+    size_t available = 0;
+
+    ringbuffer_get_write_ptr(&ws->tx_buffer, &write_ptr, &available);
+
+    // Unlikely: ringbuffer should have sufficient contiguous space
+    if (__builtin_expect(available < total_size, 0)) {
+        // Not enough contiguous space - need to handle wraparound or partial writes
+        // For simplicity, write in two parts if needed
+        // Likely: at least have space for frame header
+        if (__builtin_expect(available >= frame_len, 1)) {
+            // Write frame header
+            memcpy(write_ptr, frame, frame_len);
+            ringbuffer_commit_write(&ws->tx_buffer, frame_len);
+
+            // Write payload
+            ringbuffer_get_write_ptr(&ws->tx_buffer, &write_ptr, &available);
+            // Unlikely: should have space for payload after wraparound
+            if (__builtin_expect(available < len, 0)) {
+                return -1;  // Not enough space for payload
+            }
+            memcpy(write_ptr, data, len);
+            ringbuffer_commit_write(&ws->tx_buffer, len);
+        } else {
+            return -1;  // Not enough space
+        }
+    } else {
+        // Likely: enough contiguous space - write both frame and data in one go
+        memcpy(write_ptr, frame, frame_len);
+        memcpy(write_ptr + frame_len, data, len);
+        ringbuffer_commit_write(&ws->tx_buffer, total_size);
+    }
+
+    // Optimization #8: Mark that we have pending TX data
+    ws->has_pending_tx = 1;
+
     return len;
 }
 
 void ws_close(websocket_context_t *ws) {
     if (ws) {
-        ws->state = WS_STATE_CLOSED;
+        ws->connected = 0;
+        ws->closed = 1;
+        // Note: Socket fd is not closed here - it will be closed in ws_free()
+        // This allows any buffered data to be processed before cleanup
     }
 }
 
 ws_state_t ws_get_state(websocket_context_t *ws) {
-    return ws ? ws->state : WS_STATE_ERROR;
+    if (!ws) return WS_STATE_ERROR;
+    if (ws->closed) return WS_STATE_CLOSED;
+    if (!ws->connected) return WS_STATE_CONNECTING;
+    return WS_STATE_CONNECTED;
 }
-
-// CPU Affinity and Real-Time Priority Implementation
-
-#ifdef __linux__
-// Linux implementation using pthread_setaffinity_np and sched_setscheduler
-
-int ws_set_thread_affinity(int cpu_id) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu_id, &cpuset);
-
-    pthread_t thread = pthread_self();
-    int result = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
-
-    if (result != 0) {
-        fprintf(stderr, "Failed to set CPU affinity to core %d: %s\n",
-                cpu_id, strerror(result));
-        return -1;
-    }
-
-    return 0;
-}
-
-int ws_set_thread_realtime_priority(int priority) {
-    if (priority < 0 || priority > 99) {
-        fprintf(stderr, "Invalid priority %d (must be 0-99)\n", priority);
-        return -1;
-    }
-
-    struct sched_param param;
-    param.sched_priority = priority;
-
-    // Try SCHED_FIFO first (deterministic, no time slicing)
-    int policy = (priority > 0) ? SCHED_FIFO : SCHED_OTHER;
-    int result = sched_setscheduler(0, policy, &param);
-
-    if (result != 0) {
-        // Try SCHED_RR as fallback (round-robin with time slicing)
-        if (priority > 0) {
-            policy = SCHED_RR;
-            result = sched_setscheduler(0, policy, &param);
-        }
-
-        if (result != 0) {
-            fprintf(stderr, "Failed to set realtime priority %d: %s\n",
-                    priority, strerror(errno));
-            fprintf(stderr, "Hint: Run with CAP_SYS_NICE capability or as root\n");
-            return -1;
-        }
-    }
-
-    return 0;
-}
-
-int ws_get_thread_affinity(void) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-
-    pthread_t thread = pthread_self();
-    int result = pthread_getaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
-
-    if (result != 0) {
-        return -1;
-    }
-
-    // Return first CPU in the set
-    for (int i = 0; i < CPU_SETSIZE; i++) {
-        if (CPU_ISSET(i, &cpuset)) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
-int ws_get_thread_realtime_priority(void) {
-    int policy = sched_getscheduler(0);
-    if (policy < 0) {
-        return -1;
-    }
-
-    if (policy != SCHED_FIFO && policy != SCHED_RR) {
-        return 0;  // Not real-time
-    }
-
-    struct sched_param param;
-    if (sched_getparam(0, &param) != 0) {
-        return -1;
-    }
-
-    return param.sched_priority;
-}
-
-#elif defined(__APPLE__)
-// macOS implementation using thread affinity tags and pthread scheduling
-
-int ws_set_thread_affinity(int cpu_id) {
-    // macOS doesn't support hard CPU pinning like Linux
-    // We use thread affinity tags as a hint to the scheduler
-    thread_affinity_policy_data_t policy = { cpu_id + 1 };  // Tag (not CPU ID)
-
-    thread_port_t thread_port = pthread_mach_thread_np(pthread_self());
-    kern_return_t result = thread_policy_set(
-        thread_port,
-        THREAD_AFFINITY_POLICY,
-        (thread_policy_t)&policy,
-        THREAD_AFFINITY_POLICY_COUNT
-    );
-
-    if (result != KERN_SUCCESS) {
-        fprintf(stderr, "Failed to set thread affinity tag %d: %d\n", cpu_id, result);
-        fprintf(stderr, "Note: macOS uses affinity tags, not hard CPU pinning\n");
-        return -1;
-    }
-
-    return 0;
-}
-
-int ws_set_thread_realtime_priority(int priority) {
-    if (priority < 0 || priority > 99) {
-        fprintf(stderr, "Invalid priority %d (must be 0-99)\n", priority);
-        return -1;
-    }
-
-    pthread_t thread = pthread_self();
-    struct sched_param param;
-    int policy;
-
-    if (priority > 0) {
-        // Set real-time priority (requires root on macOS)
-        policy = SCHED_RR;  // macOS prefers SCHED_RR over SCHED_FIFO
-        param.sched_priority = priority;
-    } else {
-        // Reset to normal priority
-        policy = SCHED_OTHER;
-        param.sched_priority = 0;
-    }
-
-    int result = pthread_setschedparam(thread, policy, &param);
-
-    if (result != 0) {
-        fprintf(stderr, "Failed to set realtime priority %d: %s\n",
-                priority, strerror(result));
-        fprintf(stderr, "Hint: Requires root privileges on macOS\n");
-        return -1;
-    }
-
-    return 0;
-}
-
-int ws_get_thread_affinity(void) {
-    // macOS doesn't provide API to query affinity tags
-    fprintf(stderr, "Thread affinity query not supported on macOS\n");
-    return -1;
-}
-
-int ws_get_thread_realtime_priority(void) {
-    pthread_t thread = pthread_self();
-    struct sched_param param;
-    int policy;
-
-    int result = pthread_getschedparam(thread, &policy, &param);
-    if (result != 0) {
-        return -1;
-    }
-
-    if (policy != SCHED_FIFO && policy != SCHED_RR) {
-        return 0;  // Not real-time
-    }
-
-    return param.sched_priority;
-}
-
-#else
-// Fallback implementation for unsupported platforms
-
-int ws_set_thread_affinity(int cpu_id) {
-    (void)cpu_id;
-    fprintf(stderr, "CPU affinity not supported on this platform\n");
-    return -1;
-}
-
-int ws_set_thread_realtime_priority(int priority) {
-    (void)priority;
-    fprintf(stderr, "Real-time priority not supported on this platform\n");
-    return -1;
-}
-
-int ws_get_thread_affinity(void) {
-    return -1;
-}
-
-int ws_get_thread_realtime_priority(void) {
-    return -1;
-}
-
-#endif
 

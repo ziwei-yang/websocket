@@ -46,5 +46,9 @@ int ssl_hw_timestamping_enabled(ssl_context_t *ctx);
 // Returns timestamp in nanoseconds
 uint64_t ssl_get_hw_timestamp(ssl_context_t *ctx);
 
+// Check if Kernel TLS (kTLS) is enabled (Linux only, returns 0 on other platforms or if not enabled)
+// When kTLS is enabled, encryption/decryption is offloaded to the kernel for better performance
+int ssl_ktls_enabled(ssl_context_t *ctx);
+
 #endif // SSL_H
 

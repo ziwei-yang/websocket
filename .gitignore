@@ -19,6 +19,9 @@ test_binance_integration
 debug_test
 ssl_test_conn
 
+# Unit test executables
+test/unit/test_bug*
+
 # Static library
 libws.a
 
@@ -76,6 +79,12 @@ third_party/
 *.gcno
 *.gcov
 coverage/
+
+# Profile-Guided Optimization (PGO) artifacts
+*.profraw
+*.profdata
+default.profdata
+default*.profraw
 
 # Package files
 *.tar.gz
