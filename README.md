@@ -5,10 +5,10 @@ A high-performance WebSocket library designed for high-frequency trading and rea
 ## Features
 
 ### Core Performance
-- **Ultra-low latency**: Optimized for high-frequency trading use cases (~2-3 μs median processing latency)
-- **Ring buffer memory model**: Pre-allocated 10MB ring buffer with zero allocations during operation
-- **Zero-copy design**: Single reader/writer lock-free design eliminates contention
-- **SSL/TLS support**: Built on OpenSSL with replaceable SSL backend
+- **Ultra-low latency**: Optimized for high-frequency trading use cases (~40-180 μs median processing latency)
+- **Ring buffer memory model**: Pre-allocated 8MB ring buffer with virtual memory mirroring for zero-wraparound reads
+- **Zero-copy design**: Single reader/writer lock-free design eliminates contention, direct pointer access to buffers
+- **SSL/TLS support**: Multi-backend abstraction supporting LibreSSL, BoringSSL, and OpenSSL 3.x
 - **Lightweight HTTP parsing**: Custom HTTP parser optimized for WebSocket handshakes
 
 ### Platform-Specific Optimizations
@@ -38,14 +38,24 @@ A high-performance WebSocket library designed for high-frequency trading and rea
 ### Prerequisites
 
 - **C Compiler**: GCC or Clang with C11 support
-- **OpenSSL**: libssl-dev (OpenSSL 1.1.0 or later)
+- **SSL Library** (choose one):
+  - **LibreSSL** (recommended for macOS): Fast, secure OpenSSL fork
+  - **BoringSSL**: Google's OpenSSL fork optimized for performance
+  - **OpenSSL 3.x**: Standard OpenSSL implementation
 - **CMocka** (optional): Only required for unit tests
 - **Operating System**: Linux, macOS, or BSD
 
 ### Installation (macOS)
 
 ```bash
-brew install openssl cmocka
+# LibreSSL (recommended)
+brew install libressl cmocka
+
+# Or BoringSSL (for comparison)
+brew install boringssl cmocka
+
+# Or OpenSSL 3.x
+brew install openssl@3 cmocka
 ```
 
 ### Installation (Ubuntu/Debian)
@@ -58,32 +68,32 @@ sudo apt-get install build-essential libssl-dev libcmocka-dev
 ### Build Commands
 
 ```bash
-# Build library only
+# Build library with default SSL backend (LibreSSL on macOS, OpenSSL on Linux)
 make
 
-# Build and run all unit tests
-make test
+# Build with specific SSL backend
+SSL_BACKEND=libressl make      # LibreSSL (recommended)
+SSL_BACKEND=boringssl make     # BoringSSL
+SSL_BACKEND=openssl make       # OpenSSL 3.x
 
 # Build and run integration test (Binance WebSocket)
 make integration-test
 
+# Build SSL performance benchmark
+make ssl-benchmark
+
+# Run integration test with profiling
+make integration-test-profile
+
 # Clean build artifacts
 make clean
-
-# Debug build with symbols
-make debug
-
-# Optimized release build
-make release
 ```
 
 ### Build Output
 
 - **`libws.a`** - Static library for linking
-- **`test_ringbuffer`** - Ring buffer unit tests
-- **`test_ssl`** - SSL/TLS unit tests
-- **`test_ws`** - WebSocket protocol unit tests
 - **`test_binance_integration`** - Real-world integration test with comprehensive latency benchmarking
+- **`ssl_benchmark`** - SSL performance comparison tool across LibreSSL/BoringSSL/OpenSSL backends
 
 ## Usage
 
@@ -107,10 +117,10 @@ sudo ./test_binance_integration --cpu 2 --rt-priority 50
 ```
 
 The integration test connects to Binance's real-time market data stream and provides comprehensive latency analysis:
-- Receives 100+ messages and measures processing latency
+- Runs 5 iterations with 2000 total messages (300 analyzed per run after 100-message warmup)
 - Reports detailed statistics (min/max/mean/stddev/percentiles)
 - Performs outlier detection using IQR method
-- Shows batch processing efficiency
+- Aggregate statistics across all runs
 - Zero I/O overhead during measurement
 
 ### Using the Library in Your Code
@@ -175,23 +185,34 @@ gcc -o my_app my_app.c libws.a -lssl -lcrypto -lm
 ### Data Flow
 
 ```
-Exchange Server → TCP/IP → SSL/TLS → HTTP Parser → Ring Buffer → User Code
+Exchange Server → TCP/IP → SSL/TLS → WebSocket Parser → Ring Buffer → User Callback
+                                ↓
+                        Event Notifier (kqueue/epoll)
 ```
 
-1. **TCP/IP socket**: Raw network I/O using socket.h
-2. **SSL/TLS**: OpenSSL for encryption/decryption
-3. **HTTP Parser**: Custom parser for WebSocket handshake
-4. **Ring Buffer**: Pre-allocated 10MB circular buffer
+1. **TCP/IP socket**: Raw network I/O using POSIX sockets
+2. **Event Notifier**: Unified abstraction over kqueue/epoll/select for I/O multiplexing
+3. **SSL/TLS**: LibreSSL/BoringSSL/OpenSSL for encryption/decryption
+4. **HTTP Parser**: Custom parser for WebSocket handshake
+5. **WebSocket Parser**: RFC 6455 frame parsing with opcode handling
+6. **Ring Buffer**: Pre-allocated 8MB circular buffer with virtual memory mirroring
 
 ### Memory Model
 
-- **Ring Buffer**: 10MB pre-allocated buffer
+- **Ring Buffer**: 8MB pre-allocated buffer with virtual memory mirroring
+- **Virtual Mirroring**: Zero-wraparound reads via dual memory mapping (Linux/macOS)
 - **Single Writer/Reader**: No contention, lock-free design
+- **Cache-Line Alignment**: Producer/consumer offsets on separate cache lines (128B on Apple Silicon, 64B on x86)
 - **Minimal Allocations**: Zero allocations during message processing
 
-### SSL/TLS Backend
+### SSL/TLS Backend Abstraction
 
-The `ssl.h` interface wraps OpenSSL, allowing future performance enhancements or backend replacement without changing the WebSocket API.
+The library supports multiple SSL backends through a unified `ssl.h` interface:
+- **LibreSSL**: Recommended for macOS - clean API, good performance
+- **BoringSSL**: Google's fork - optimized for speed, minimal features
+- **OpenSSL 3.x**: Standard implementation - widely compatible
+
+Backend selection via `SSL_BACKEND` environment variable at build time.
 
 ## Latency Benchmarking
 
@@ -204,20 +225,29 @@ The integration test (`test_binance_integration`) provides production-grade late
 ║           LATENCY BENCHMARK RESULTS (NO I/O IN HOT PATH)        ║
 ╚══════════════════════════════════════════════════════════════════╝
 
-📊 Processing Latency (Socket Receive → Callback Invocation):
+📈 Aggregate Dataset Information:
+   Completed runs:             5 / 5
+   Messages analyzed per run:  300
+   Total analyzed messages:    1500
+   Timer: mach_absolute_time() (Apple Silicon)
+
+📊 Aggregate Processing Latency:
 ┌──────────────┬──────────────┬──────────────┐
 │   Metric     │ Timer Ticks  │ Nanoseconds  │
 ├──────────────┼──────────────┼──────────────┤
-│ Min          │          455 │     18958.33 │
-│ Max          │          681 │     28375.00 │
-│ Mean         │          552 │     22999.70 │
-│ Std Dev      │           74 │      3068.50 │
-│ P50 (median) │          524 │     21833.33 │
-│ P90          │          661 │     27541.67 │
-│ P95          │          672 │     28000.00 │
-│ P99          │          680 │     28333.33 │
-│ P99.9        │          681 │     28375.00 │
+│ Min          │          165 │      6875.00 │
+│ Max          │        31032 │   1293000.00 │
+│ Mean         │         1592 │     66291.67 │
+│ Std Dev      │         1585 │     66041.67 │
+│ P50 (median) │         1015 │     42291.67 │
+│ P90          │         3867 │    161125.00 │
+│ P95          │         4145 │    172708.33 │
+│ P99          │         4576 │    190666.67 │
+│ P99.9        │        25791 │   1074625.00 │
 └──────────────┴──────────────┴──────────────┘
+
+🔍 Aggregate Outlier Analysis:
+   Outliers detected: 28 / 1500 (1.87%)
 ```
 
 ### Features
@@ -268,15 +298,18 @@ The test validates the library under production conditions with actual market da
 
 ```
 .
-├── ringbuffer.h/c              # Lock-free ring buffer implementation
-├── ssl.h/c                     # SSL/TLS abstraction layer (OpenSSL wrapper)
+├── ringbuffer.h/c              # Lock-free ring buffer with virtual memory mirroring
+├── ssl.h/c                     # SSL/TLS abstraction layer
+├── ssl_backend.h               # SSL backend selection (LibreSSL/BoringSSL/OpenSSL)
 ├── ws.h/c                      # WebSocket protocol implementation
+├── ws_notifier.h/c             # Unified event notification (kqueue/epoll/select)
+├── os.h/c                      # OS abstraction for CPU cycle timing
 ├── test/
-│   ├── ringbuffer_test.c       # Ring buffer unit tests
-│   ├── ssl_test.c              # SSL/TLS unit tests
-│   ├── ws_test.c               # WebSocket unit tests
-│   └── integration/
-│       └── binance.c           # Integration test with comprehensive benchmarking
+│   ├── integration/
+│   │   └── binance.c           # Integration test with comprehensive benchmarking
+│   └── ssl_benchmark.c         # SSL backend performance comparison tool
+├── example/
+│   └── simple_ws.c             # Simple usage example
 ├── doc/
 │   └── websocket_design.md     # Architecture and design documentation
 ├── .gitignore                  # Git ignore patterns
@@ -287,17 +320,18 @@ The test validates the library under production conditions with actual market da
 ## Platform-Specific Notes
 
 ### macOS (Apple Silicon)
-- **Event Loop**: Uses `kqueue()` for event-driven I/O
-- **Timer**: ARM64 system counter at fixed 24 MHz (41.67 ns/tick)
-- **Timer Source**: Reads `cntfrq_el0` register directly
-- **Expected Latency**: ~2-3 μs median processing latency
+- **Event Loop**: Uses `kqueue()` with EV_CLEAR edge-triggered mode
+- **Timer**: `mach_absolute_time()` (nanosecond precision)
+- **Ringbuffer**: Virtual memory mirroring typically succeeds on macOS
+- **Expected Latency**: ~40-180 μs median processing latency (P50-P95)
 
 ### Linux x86_64
-- **Event Loop**: Uses `epoll()` for high-performance I/O multiplexing
+- **Event Loop**: Uses `epoll()` with EPOLLET edge-triggered mode
 - **Timer**: TSC (Time Stamp Counter) with calibration
 - **Timer Calibration**: Busy-wait method with median of 3 measurements
 - **Hardware Timestamping**: Optional NIC-level packet timestamps (SO_TIMESTAMPING)
-- **Expected Latency**: ~1-2 μs median processing latency (varies by CPU)
+- **Ringbuffer**: Virtual memory mirroring supported via memfd_create or shm_open
+- **Expected Latency**: Varies by CPU and SSL backend (typically ~20-100 μs median)
 
 ### Performance Tuning
 
@@ -327,6 +361,26 @@ echo "1" | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
 # AMD
 echo "0" | sudo tee /sys/devices/system/cpu/cpufreq/boost
 ```
+
+## SSL Backend Benchmarking
+
+The `ssl_benchmark` tool compares SSL performance across different backends:
+
+```bash
+# Build for all backends
+make ssl-benchmark
+
+# Or build for specific backend
+SSL_BACKEND=boringssl make ssl-benchmark
+```
+
+The benchmark measures:
+- **SSL_read latency**: Time to decrypt data from SSL stream
+- **SSL_write latency**: Time to encrypt data for transmission
+- **Throughput**: Bytes processed per second
+- **Memory usage**: Heap allocations during SSL operations
+
+Use this tool to select the optimal SSL backend for your platform and use case.
 
 ## License
 
