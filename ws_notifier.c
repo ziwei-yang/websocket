@@ -189,8 +189,11 @@ int ws_notifier_mod(ws_notifier_t *notifier, int fd, int events) {
 
     if (n_changes > 0) {
         if (kevent(notifier->kqueue_fd, kev, n_changes, NULL, 0, NULL) < 0) {
-            perror("kevent MOD");
-            return -1;
+            // ENOENT is acceptable (filter didn't exist when trying to delete)
+            if (errno != ENOENT) {
+                perror("kevent MOD");
+                return -1;
+            }
         }
     }
 
@@ -221,8 +224,14 @@ int ws_notifier_del(ws_notifier_t *notifier, int fd) {
     EV_SET(&kev[0], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
     EV_SET(&kev[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
 
-    // It's okay if deletion fails (filter might not exist)
-    kevent(notifier->kqueue_fd, kev, 2, NULL, 0, NULL);
+    // Check return value and only accept ENOENT as an acceptable error
+    if (kevent(notifier->kqueue_fd, kev, 2, NULL, 0, NULL) < 0) {
+        // Only acceptable error is ENOENT (filter didn't exist)
+        if (errno != ENOENT) {
+            perror("kevent DEL");
+            return -1;
+        }
+    }
 
     return 0;
 #else

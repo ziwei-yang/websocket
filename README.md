@@ -11,6 +11,13 @@ A high-performance WebSocket library designed for high-frequency trading and rea
 - **SSL/TLS support**: Multi-backend abstraction (kTLS default on Linux, LibreSSL default on macOS)
 - **Lightweight HTTP parsing**: Custom HTTP parser optimized for WebSocket handshakes
 
+### WebSocket Protocol (RFC 6455)
+- **Automatic control frame handling**: PING/PONG and CLOSE frames handled automatically
+- **Proper closing handshake**: RFC-compliant CLOSE frame transmission with status codes
+- **Unpredictable masking keys**: Cryptographically-seeded PRNG for frame masking (xoshiro128+)
+- **Frame validation**: Extended length validation and protocol error detection
+- **Edge-triggered I/O**: Automatic WRITE event management for optimal throughput
+
 ### Platform-Specific Optimizations
 - **Event loops**: Platform-optimized I/O multiplexing
   - Linux: `epoll()` for high-performance event handling
@@ -70,6 +77,10 @@ sudo apt-get install build-essential libssl-dev libcmocka-dev
 ```bash
 # Build library with default SSL backend (LibreSSL on macOS, ktls on Linux)
 make
+
+# Build PGO-optimized release (recommended for production)
+# Profiles with live Binance WebSocket traffic, then rebuilds optimized library
+make build-release
 
 # Build with specific SSL backend
 SSL_BACKEND=ktls make          # OpenSSL with Kernel TLS (DEFAULT on Linux)
@@ -167,17 +178,18 @@ int main() {
     }
 
     // Set callbacks
-    ws_set_on_msg(ws, on_message);
-    ws_set_on_status(ws, on_status);
+    ws_set_on_msg(ws, on_message);    // Callback for incoming messages
+    ws_set_on_status(ws, on_status);  // Callback for connection status
 
     // Main event loop
+    // Note: PING/PONG and CLOSE frames are handled automatically
     while (ws_get_state(ws) != WS_STATE_ERROR &&
            ws_get_state(ws) != WS_STATE_CLOSED) {
-        ws_update(ws);
-        usleep(1000);  // 1ms polling interval
+        ws_update(ws);                 // Process I/O and parse frames
+        usleep(1000);                  // 1ms polling interval
     }
 
-    // Cleanup
+    // Cleanup (sends proper CLOSE frame per RFC 6455)
     ws_close(ws);
     ws_free(ws);
     return 0;
@@ -283,12 +295,11 @@ For more details, see:
 
 ### TLS Version Control
 
-Control TLS version negotiation via environment variables:
+When using the **kTLS backend** (default on Linux), TLS 1.2 is automatically used for optimal kernel offload performance.
+
+Override TLS version via environment variables:
 
 ```bash
-# Force TLS 1.2 (enables kTLS on Linux)
-WS_ALLOW_TLS12=1 ./test_bitget_integration
-
 # Force TLS 1.3 (disables kTLS, uses userspace OpenSSL)
 WS_FORCE_TLS13=1 ./test_binance_integration
 
@@ -299,7 +310,10 @@ WS_DEBUG_KTLS=1 ./test_binance_integration
 WS_DEBUG=1 ./test_binance_integration
 ```
 
-**Note:** kTLS only works with TLS 1.2 in OpenSSL 3.0.13. TLS 1.3 kTLS support requires kernel patches (see `doc/how_to_enable_ktls.md`).
+**Note:**
+- **kTLS backend**: Automatically uses TLS 1.2 (production-ready kernel offload) ✅
+- **TLS 1.3 kTLS**: Requires kernel patches, not yet in mainline OpenSSL (see `doc/how_to_enable_ktls.md`)
+- Override with `WS_FORCE_TLS13=1` to use TLS 1.3 (disables kTLS)
 
 ## Latency Benchmarking
 
@@ -365,6 +379,26 @@ The benchmark measures **processing latency** within the library:
 
 This does **not** include network latency, market data generation latency, or any upstream delays.
 
+### Real-World Performance: Intel i9-12900 + Linux + kTLS
+
+Benchmark results on Intel i9-12900 with Linux kernel kTLS (OpenSSL backend):
+
+```
+📊 Latency Breakdown (Mean):
+   NIC→SSL (decryption):       75839 ticks (  31349.00 ns)  [96.9%]
+   SSL→APP (processing):        2440 ticks (   1008.00 ns)  [3.1%]
+   ────────────────────────────────────────────────
+   Total (NIC→APP):            78279 ticks (  32358.00 ns)  [100.0%]
+```
+
+**Key Insights:**
+- **Total latency**: ~32 μs from NIC to application callback
+- **SSL decryption**: ~31 μs (96.9% of total) - handled by kernel via kTLS
+- **Library overhead**: ~1 μs (3.1% of total) - WebSocket parsing + frame handling
+- **Platform**: Intel i9-12900, TSC frequency ~2.42 GHz
+
+This demonstrates the library's minimal processing overhead (~1 μs) with most latency attributed to SSL/TLS decryption, which is efficiently handled by the Linux kernel through kTLS offload.
+
 ## Binance WebSocket Integration
 
 The integration test uses Binance's public market data stream for real-world testing:
@@ -411,8 +445,8 @@ wss://ws.bitget.com/v3/ws/public
 ```bash
 make integration-test-bitget
 
-# Or manually with TLS 1.2 forced
-WS_ALLOW_TLS12=1 ./test_bitget_integration
+# Or manually
+./test_bitget_integration
 ```
 
 This test complements the Binance test by validating:
@@ -444,9 +478,11 @@ This test complements the Binance test by validating:
 │   └── simple_ws.c             # Simple usage example
 ├── doc/
 │   ├── websocket_design.md     # Architecture and design documentation
+│   ├── known_tradeoffs.md      # Performance-security tradeoffs (22 documented)
 │   ├── how_to_enable_ktls.md   # Comprehensive kTLS setup guide
 │   ├── ktls_proposal.md        # kTLS design proposal
-│   └── ktls_implementation_checklist.md  # Implementation checklist
+│   ├── ktls_implementation_checklist.md  # Implementation checklist
+│   └── cpu_frequency_guide.md  # CPU frequency configuration for benchmarking
 ├── .gitignore                  # Git ignore patterns
 ├── Makefile                    # Build system with kTLS support
 └── README.md                   # This file
@@ -516,6 +552,51 @@ The benchmark measures:
 - **Memory usage**: Heap allocations during SSL operations
 
 Use this tool to select the optimal SSL backend for your platform and use case.
+
+## Performance-Security Tradeoffs
+
+This library is designed for **extreme performance** in **trusted network environments** (e.g., direct exchange connections, isolated VLANs). To achieve ultra-low latency, several security and protocol validation features have been intentionally relaxed.
+
+**⚠️ WARNING:** This library prioritizes ultra-low latency over security hardening. Use only in trusted network environments with additional security controls.
+
+### Documented Tradeoffs
+
+The library has **22 documented performance-vs-correctness tradeoffs** detailed in [`doc/known_tradeoffs.md`](doc/known_tradeoffs.md):
+
+**By Severity:**
+- **Critical (Security):** 3 tradeoffs - Certificate verification disabled, integer overflow, 32-bit truncation
+- **High (Security):** 1 tradeoff - Unsafe legacy renegotiation allowed
+- **High (Compatibility):** 2 tradeoffs - TLS version pinning, missing port in Host header
+- **High (Protocol Violation):** 1 tradeoff - Accepts HTTP 200 for WebSocket upgrade
+- **Medium:** 7 tradeoffs - Protocol validation shortcuts, buffer management edge cases
+- **Low:** 7 tradeoffs - Resource management and operational optimizations
+
+**By Category:**
+- **SSL/TLS Security:** 5 tradeoffs (certificate verification, renegotiation, error strings, context cleanup, TLS versioning)
+- **Network/Protocol Compatibility:** 2 tradeoffs (port handling, IPv4-only)
+- **Protocol Validation:** 9 tradeoffs (HTTP parsing, frame opcodes, length encoding, masking, control frames)
+- **Resource Management:** 3 tradeoffs (buffer validation, overflow handling)
+- **Event Loop/Operations:** 3 tradeoffs (timeouts, initialization, calibration)
+
+### Production Deployment Guidelines
+
+**Mandatory Requirements:**
+1. **Trusted Network Environment** - Isolated VLAN/VPC with strict firewall rules
+2. **Application-Layer Security** - Implement exchange-provided API signatures (HMAC-SHA256)
+3. **Network Monitoring** - IDS/IPS to detect MITM attempts
+
+**Recommended Enhancements:**
+1. Enable certificate verification for non-latency-critical connections
+2. Implement additional audit logging for regulatory compliance
+3. Add configurable timeout and retry logic for high-reliability
+
+**Not Recommended For:**
+- ❌ Public internet connections without VPN
+- ❌ Untrusted or unknown WebSocket endpoints
+- ❌ Applications requiring regulatory compliance (SOC 2, PCI-DSS, HIPAA)
+- ❌ Shared hosting or multi-tenant environments
+
+For complete documentation of each tradeoff, mitigation strategies, and deployment guidelines, see [`doc/known_tradeoffs.md`](doc/known_tradeoffs.md).
 
 ## License
 

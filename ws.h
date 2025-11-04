@@ -6,6 +6,7 @@
 #include <sys/time.h>
 
 typedef struct websocket_context websocket_context_t;
+typedef struct ws_notifier ws_notifier_t;
 
 // Zero-copy message callback - receives direct memory pointer and length
 typedef void (*ws_on_msg_t)(websocket_context_t *ws, const uint8_t *payload_ptr, size_t payload_len, uint8_t opcode);
@@ -56,6 +57,18 @@ uint64_t ws_get_ssl_read_timestamp(websocket_context_t *ws);
 // Get socket file descriptor for select/poll/epoll
 // Returns -1 on error
 int ws_get_fd(websocket_context_t *ws);
+
+// Connect websocket context to event loop notifier for automatic WRITE event management
+// When set, ws_send() will auto-register WRITE events and ws_update() will auto-unregister when TX buffer drains
+void ws_set_notifier(websocket_context_t *ws, ws_notifier_t *notifier);
+
+// Query if TX buffer has pending data (for manual event management)
+// Returns 1 if there is pending TX data, 0 otherwise
+int ws_wants_write(websocket_context_t *ws);
+
+// Flush TX buffer immediately without waiting for event loop
+// Returns 0 on success, -1 on error
+int ws_flush_tx(websocket_context_t *ws);
 
 // Get hardware NIC timestamp (Linux only, returns 0 if not available)
 // Timestamp in nanoseconds from hardware network card

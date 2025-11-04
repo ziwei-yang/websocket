@@ -1,8 +1,4 @@
-// Define _GNU_SOURCE before any includes for Linux
-#ifdef __linux__
-#define _GNU_SOURCE
-#endif
-
+// _GNU_SOURCE is defined via Makefile (-D_GNU_SOURCE) for Linux builds
 #include "os.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -498,6 +494,11 @@ double os_cycles_to_ns(uint64_t cycles) {
     // Common case: numer=125, denom=3 (M1/M2/M3/M4)
     // cycles * 125 / 3 = (cycles * 42667) >> 10 (error < 0.01%)
     if (g_timebase.numer == 125 && g_timebase.denom == 3) {
+        // Check for potential overflow
+        if (cycles > (UINT64_MAX / 42667ULL)) {
+            // Fall back to division method for large values
+            return (double)(cycles * g_timebase.numer / g_timebase.denom);
+        }
         // Fast path: fixed-point multiplication (5-10x faster than FP)
         return (double)((cycles * 42667ULL) >> 10);
     }
@@ -515,6 +516,12 @@ double os_cycles_to_ns(uint64_t cycles) {
     static uint64_t g_ns_per_cycle_fp = 0;
     if (__builtin_expect(g_ns_per_cycle_fp == 0, 0)) {
         g_ns_per_cycle_fp = (uint64_t)(g_ns_per_cycle * 4294967296.0);
+    }
+
+    // Check for overflow
+    if (cycles > (UINT64_MAX / g_ns_per_cycle_fp)) {
+        // Fall back to floating-point for very large values
+        return cycles * g_ns_per_cycle;
     }
     return (double)((cycles * g_ns_per_cycle_fp) >> 32);
 #else

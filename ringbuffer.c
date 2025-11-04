@@ -1,6 +1,7 @@
 #include "ringbuffer.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <sys/mman.h>
 #include <stdio.h>
 #include <fcntl.h>
@@ -35,8 +36,19 @@ static int try_create_mirrored_buffer(ringbuffer_t *rb) {
     int fd;
 #ifdef __APPLE__
     // macOS: Use temporary file for shared memory
+    // Use atomic counter for unique naming to avoid collisions
+    static _Atomic int shm_counter = 0;
+    int counter = __atomic_fetch_add(&shm_counter, 1, __ATOMIC_SEQ_CST);
+
     char shm_name[256];
-    snprintf(shm_name, sizeof(shm_name), "/tmp/ringbuffer_%d_%p", getpid(), (void*)rb);
+    // Check snprintf return value
+    int ret = snprintf(shm_name, sizeof(shm_name), "/tmp/ringbuffer_%d_%d_%lx",
+                       getpid(), counter, (unsigned long)(uintptr_t)rb);
+    if (ret < 0 || ret >= (int)sizeof(shm_name)) {
+        munmap(addr, 2 * RINGBUFFER_SIZE);
+        return -1;
+    }
+
     fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0) {
         munmap(addr, 2 * RINGBUFFER_SIZE);
@@ -47,8 +59,19 @@ static int try_create_mirrored_buffer(ringbuffer_t *rb) {
     // Linux: Use memfd_create if available, otherwise shm_open
     fd = memfd_create("ringbuffer", 0);
     if (fd < 0) {
+        // Use atomic counter for unique naming
+        static _Atomic int shm_counter = 0;
+        int counter = __atomic_fetch_add(&shm_counter, 1, __ATOMIC_SEQ_CST);
+
         char shm_name[256];
-        snprintf(shm_name, sizeof(shm_name), "/ringbuffer_%d_%p", getpid(), (void*)rb);
+        // Check snprintf return value
+        int ret = snprintf(shm_name, sizeof(shm_name), "/ringbuffer_%d_%d_%lx",
+                           getpid(), counter, (unsigned long)(uintptr_t)rb);
+        if (ret < 0 || ret >= (int)sizeof(shm_name)) {
+            munmap(addr, 2 * RINGBUFFER_SIZE);
+            return -1;
+        }
+
         fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
         if (fd < 0) {
             munmap(addr, 2 * RINGBUFFER_SIZE);
@@ -78,7 +101,9 @@ static int try_create_mirrored_buffer(ringbuffer_t *rb) {
     void *addr2 = mmap((uint8_t*)addr + RINGBUFFER_SIZE, RINGBUFFER_SIZE,
                        PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, fd, 0);
     if (addr2 == MAP_FAILED || addr2 != (uint8_t*)addr + RINGBUFFER_SIZE) {
-        munmap(addr, 2 * RINGBUFFER_SIZE);
+        // Properly clean up both mappings on failure
+        munmap(addr1, RINGBUFFER_SIZE);
+        munmap((uint8_t*)addr + RINGBUFFER_SIZE, RINGBUFFER_SIZE);
         close(fd);
         return -1;
     }

@@ -3,6 +3,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -79,14 +80,39 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     // Initialize OpenSSL library if not already done
     ssl_init_once();
     if (!global_ctx) return NULL;
-    
-    // Check for NULL parameters
-    if (!hostname || port < 0 || port > 65535) return NULL;
-    
+
+    // Check for NULL parameters and valid port range
+    if (!hostname || port <= 0 || port > 65535) return NULL;
+
+    // Use getaddrinfo() instead of deprecated gethostbyname()
+    // Resolve hostname BEFORE allocating context to avoid leaks on failure
+    struct addrinfo hints, *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    if (getaddrinfo(hostname, port_str, &hints, &result) != 0) {
+        return NULL;
+    }
+
+    // Allocate context AFTER successful hostname resolution
     ssl_context_t *sctx = (ssl_context_t *)malloc(sizeof(ssl_context_t));
-    if (!sctx) return NULL;
-    
+    if (!sctx) {
+        freeaddrinfo(result);
+        return NULL;
+    }
+
+    // Check strdup() return value
     sctx->hostname = strdup(hostname);
+    if (!sctx->hostname) {
+        free(sctx);
+        freeaddrinfo(result);
+        return NULL;
+    }
+
     sctx->port = port;
     sctx->ssl = NULL;
     sctx->sockfd = -1;
@@ -96,17 +122,11 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     sctx->ktls_checked = 0;  // Will be set to 1 after kTLS detection completes
 
     // Create socket
-    struct hostent *server = gethostbyname(hostname);
-    if (!server) {
-        free(sctx->hostname);
-        free(sctx);
-        return NULL;
-    }
-
     sctx->sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sctx->sockfd < 0) {
         free(sctx->hostname);
         free(sctx);
+        freeaddrinfo(result);
         return NULL;
     }
 
@@ -120,26 +140,40 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     int rcvbuf_size = 256 * 1024;  // 256KB receive buffer
     int sndbuf_size = 256 * 1024;  // 256KB send buffer
 
-    setsockopt(sctx->sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
-    setsockopt(sctx->sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
+    // Note: Buffer size failures are non-critical (kernel may choose different sizes)
+    if (setsockopt(sctx->sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size)) != 0) {
+        fprintf(stderr, "Warning: Failed to set SO_RCVBUF: %s\n", strerror(errno));
+    }
+    if (setsockopt(sctx->sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size)) != 0) {
+        fprintf(stderr, "Warning: Failed to set SO_SNDBUF: %s\n", strerror(errno));
+    }
 
+    // Check return values from critical setsockopt() calls
     // Enable TCP_NODELAY to disable Nagle's algorithm (reduce latency)
     int nodelay = 1;
-    setsockopt(sctx->sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    if (setsockopt(sctx->sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) != 0) {
+        fprintf(stderr, "Warning: Failed to set TCP_NODELAY: %s\n", strerror(errno));
+    }
 
     // Enable SO_KEEPALIVE to detect dead connections
     int keepalive = 1;
-    setsockopt(sctx->sockfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    if (setsockopt(sctx->sockfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) != 0) {
+        fprintf(stderr, "Warning: Failed to set SO_KEEPALIVE: %s\n", strerror(errno));
+    }
 
 #ifdef __APPLE__
     // macOS-specific socket optimizations
     // Set TCP_NOOPT to disable TCP options processing for lower latency
     int tcp_noopt = 1;
-    setsockopt(sctx->sockfd, IPPROTO_TCP, TCP_NOOPT, &tcp_noopt, sizeof(tcp_noopt));
+    if (setsockopt(sctx->sockfd, IPPROTO_TCP, TCP_NOOPT, &tcp_noopt, sizeof(tcp_noopt)) != 0) {
+        fprintf(stderr, "Warning: Failed to set TCP_NOOPT: %s\n", strerror(errno));
+    }
 
     // Set SO_NOSIGPIPE to prevent SIGPIPE on broken connections
     int nosigpipe = 1;
-    setsockopt(sctx->sockfd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+    if (setsockopt(sctx->sockfd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe)) != 0) {
+        fprintf(stderr, "Warning: Failed to set SO_NOSIGPIPE: %s\n", strerror(errno));
+    }
 #endif
 
 #ifdef HW_TIMESTAMPING_SUPPORTED
@@ -156,17 +190,77 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     }
     // If setsockopt fails, we continue without timestamping (graceful degradation)
 #endif
-    
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    serv_addr.sin_port = htons(port);
-    
-    if (connect(sctx->sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        // Connection may be pending (non-blocking)
+
+    // Use non-blocking connect with timeout to avoid stalling application
+    // (kTLS requires blocking mode, but we can temporarily switch for connect)
+
+    // Set socket to non-blocking for connect with timeout
+    int flags = fcntl(sctx->sockfd, F_GETFL, 0);
+    if (flags < 0 || fcntl(sctx->sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(sctx->sockfd);
+        free(sctx->hostname);
+        free(sctx);
+        freeaddrinfo(result);
+        return NULL;
     }
-    
+
+    // Attempt non-blocking connect
+    int connect_result = connect(sctx->sockfd, result->ai_addr, result->ai_addrlen);
+
+    if (connect_result < 0) {
+        if (errno == EINPROGRESS) {
+            // Connection in progress - wait with timeout (5 seconds for HFT)
+            fd_set write_fds;
+            struct timeval timeout;
+            timeout.tv_sec = 5;
+            timeout.tv_usec = 0;
+
+            FD_ZERO(&write_fds);
+            FD_SET(sctx->sockfd, &write_fds);
+
+            int select_result = select(sctx->sockfd + 1, NULL, &write_fds, NULL, &timeout);
+
+            if (select_result <= 0) {
+                // Timeout or error
+                close(sctx->sockfd);
+                free(sctx->hostname);
+                free(sctx);
+                freeaddrinfo(result);
+                return NULL;
+            }
+
+            // Check if connection succeeded
+            int so_error;
+            socklen_t len = sizeof(so_error);
+            if (getsockopt(sctx->sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0 || so_error != 0) {
+                // Connection failed
+                close(sctx->sockfd);
+                free(sctx->hostname);
+                free(sctx);
+                freeaddrinfo(result);
+                return NULL;
+            }
+        } else {
+            // Immediate connection failure
+            close(sctx->sockfd);
+            free(sctx->hostname);
+            free(sctx);
+            freeaddrinfo(result);
+            return NULL;
+        }
+    }
+
+    // Restore blocking mode for kTLS activation during TLS handshake
+    // (OpenSSL's kTLS has issues activating on non-blocking sockets)
+    if (fcntl(sctx->sockfd, F_SETFL, flags) < 0) {
+        close(sctx->sockfd);
+        free(sctx->hostname);
+        free(sctx);
+        freeaddrinfo(result);
+        return NULL;
+    }
+
+    freeaddrinfo(result);
     return sctx;
 }
 
@@ -217,21 +311,18 @@ int ssl_handshake(ssl_context_t *sctx) {
         }
 
         #if defined(SSL_BACKEND_KTLS) && defined(KTLS_SUPPORTED)
-        // For kTLS: Allow both TLS 1.2 and 1.3 (let server choose)
-        // Set WS_FORCE_TLS13=1 to force TLS 1.3 only
-        // Set WS_ALLOW_TLS12=1 to force TLS 1.2 only (enables kTLS)
+        // For kTLS: Default to TLS 1.2 (production-ready kTLS)
+        // Set WS_FORCE_TLS13=1 to override and use TLS 1.3 (disables kTLS)
         const char *force_tls13 = getenv("WS_FORCE_TLS13");
-        const char *allow_tls12 = getenv("WS_ALLOW_TLS12");
         if (force_tls13 && atoi(force_tls13) == 1) {
-            // Force TLS 1.3 only (requires server support, kTLS limited)
+            // Override: Force TLS 1.3 only (disables kTLS, uses userspace OpenSSL)
             SSL_set_min_proto_version(sctx->ssl, TLS1_3_VERSION);
             SSL_set_max_proto_version(sctx->ssl, TLS1_3_VERSION);
-        } else if (allow_tls12 && atoi(allow_tls12) == 1) {
-            // Force TLS 1.2 for kTLS support (production-ready kTLS)
+        } else {
+            // Default: Force TLS 1.2 for kTLS support (kernel offload, best HFT performance)
             SSL_set_min_proto_version(sctx->ssl, TLS1_2_VERSION);
             SSL_set_max_proto_version(sctx->ssl, TLS1_2_VERSION);
         }
-        // Otherwise allow TLS 1.2 and 1.3 negotiation (default, prefers 1.3)
 
         // Set TLS 1.3 cipher suites (kTLS-compatible: AES-GCM and ChaCha20-Poly1305)
         const char *tls13_ciphersuites = getenv("WS_TLS13_CIPHERSUITES");
@@ -315,14 +406,19 @@ int ssl_handshake(ssl_context_t *sctx) {
     #endif
 
     // If kTLS is not enabled, we continue with userspace OpenSSL (graceful fallback)
-    sctx->ktls_checked = 1;  // Mark that we've checked kTLS (prevents re-checking)
 #endif
+
+    // Mark that handshake is complete (prevents redundant SSL_connect calls)
+    // MUST be outside #if block to work for all SSL backends
+    sctx->ktls_checked = 1;
 
     // NOW switch to non-blocking mode after successful handshake
     // (kTLS needs blocking mode during handshake to activate properly)
     int flags = fcntl(sctx->sockfd, F_GETFL, 0);
     if (flags >= 0) {
-        fcntl(sctx->sockfd, F_SETFL, flags | O_NONBLOCK);
+        if (fcntl(sctx->sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            fprintf(stderr, "Warning: Failed to set O_NONBLOCK: %s\n", strerror(errno));
+        }
     }
 
     return 1;  // Handshake completed successfully
@@ -331,7 +427,12 @@ int ssl_handshake(ssl_context_t *sctx) {
 int ssl_send(ssl_context_t *sctx, const uint8_t *data, size_t len) {
     if (__builtin_expect(!sctx || !sctx->ssl, 0)) return -1;  // Unlikely: validation
 
-    int result = SSL_write(sctx->ssl, data, len);
+    // SSL_write takes int, check for overflow
+    if (len > INT_MAX) {
+        len = INT_MAX;
+    }
+
+    int result = SSL_write(sctx->ssl, data, (int)len);
     if (__builtin_expect(result <= 0, 0)) {  // Unlikely: error path
         int err = SSL_get_error(sctx->ssl, result);
         if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
@@ -345,8 +446,13 @@ int ssl_send(ssl_context_t *sctx, const uint8_t *data, size_t len) {
 
 int ssl_recv(ssl_context_t *sctx, uint8_t *data, size_t len) {
     if (!sctx || !sctx->ssl) return -1;
-    
-    return SSL_read(sctx->ssl, data, len);
+
+    // SSL_read takes int, check for overflow (matches ssl_send)
+    if (len > INT_MAX) {
+        len = INT_MAX;
+    }
+
+    return SSL_read(sctx->ssl, data, (int)len);
 }
 
 int ssl_get_fd(ssl_context_t *sctx) {

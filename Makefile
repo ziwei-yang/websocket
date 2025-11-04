@@ -366,7 +366,7 @@ integration-test: $(OBJDIR) $(INTEGRATION_TEST_EXE)
 
 integration-test-bitget: $(OBJDIR) $(BITGET_TEST_EXE)
 	@echo "Running Bitget integration test (TLS 1.2 with kTLS)..."
-	WS_ALLOW_TLS12=1 ./$(BITGET_TEST_EXE)
+	./$(BITGET_TEST_EXE)
 
 # Build SSL benchmark
 benchmark-ssl-build: $(OBJDIR) $(SSL_BENCHMARK_EXE)
@@ -476,7 +476,7 @@ ktls-benchmark:
 
 # Clean build artifacts and PGO profiling data
 clean:
-	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(SSL_BENCHMARK_EXE) $(TIMING_TEST_EXE) $(KTLS_TEST_EXE) $(EXAMPLE_EXE)
+	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(BITGET_TEST_EXE) $(SSL_BENCHMARK_EXE) $(TIMING_TEST_EXE) $(KTLS_TEST_EXE) $(EXAMPLE_EXE) $(SSL_PROBE_EXE)
 	rm -f *.profraw *.profdata default.profdata default*.profraw
 
 # Debug build
@@ -618,9 +618,35 @@ integration-test-profile:
 	@echo "Compare the latency results above to see performance improvements"
 	@echo "=========================================="
 
+# Build PGO-optimized release library
+build-release:
+	@echo "╔══════════════════════════════════════════════════════════════════╗"
+	@echo "║          Building Profile-Guided Optimized Release              ║"
+	@echo "╚══════════════════════════════════════════════════════════════════╝"
+	@echo ""
+	@echo "[Step 1/3] Building with PGO instrumentation..."
+	@$(MAKE) profile-generate
+	@echo ""
+	@echo "[Step 2/3] Collecting profile data with Binance integration test..."
+	@echo "            (This will take ~60 seconds)"
+	@timeout 60 ./$(INTEGRATION_TEST_EXE) 2>&1 | grep -E "SSL Configuration|P50|P90|Aggregate Processing" || true
+	@echo ""
+	@echo "[Step 3/3] Building optimized library with profile data..."
+	@$(MAKE) profile-use
+	@echo ""
+	@echo "╔══════════════════════════════════════════════════════════════════╗"
+	@echo "║              PGO-Optimized Release Build Complete                ║"
+	@echo "╚══════════════════════════════════════════════════════════════════╝"
+	@echo ""
+	@echo "✅ Library built: libws.a (with profile-guided optimizations)"
+	@echo "✅ Test binary:   test_binance_integration (PGO-optimized)"
+	@echo ""
+	@echo "Profile data collected from live Binance WebSocket traffic for optimal"
+	@echo "performance on high-frequency trading workloads."
+
 # Clean only object files (keep profile data)
 clean-objs:
-	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(SSL_BENCHMARK_EXE) $(TIMING_TEST_EXE) $(KTLS_TEST_EXE) $(EXAMPLE_EXE)
+	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(BITGET_TEST_EXE) $(SSL_BENCHMARK_EXE) $(TIMING_TEST_EXE) $(KTLS_TEST_EXE) $(EXAMPLE_EXE) $(SSL_PROBE_EXE)
 
 # Clean everything including profile data
 clean-all: clean
@@ -684,6 +710,7 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  all             - Build library (default)"
+	@echo "  build-release   - Build PGO-optimized release library (profile + optimize)"
 	@echo "  example         - Build and run simple WebSocket example"
 	@echo "  test            - Run all available tests (timing + unit tests if cmocka installed)"
 	@echo "  test-timing     - Run timing precision test (verifies TSC calibration accuracy)"
@@ -718,12 +745,14 @@ help:
 	@echo ""
 	@echo "Example usage:"
 	@echo "  make                # Build library"
+	@echo "  make build-release  # Build PGO-optimized release (automated)"
 	@echo "  make example        # Build and run simple WebSocket example"
 	@echo "  make release        # Build optimized with LTO"
 	@echo "  make test           # Run all unit tests (requires cmocka)"
 	@echo "  make integration-test # Run integration test (with latency benchmarking)"
 	@echo ""
 	@echo "PGO workflow (automated):"
+	@echo "  make build-release             # Build optimized library (recommended)"
 	@echo "  make integration-test-profile  # Full automated workflow with before/after comparison"
 	@echo ""
 	@echo "PGO workflow (manual steps):"
@@ -731,4 +760,4 @@ help:
 	@echo "  ./test_binance_integration  # Run representative workload"
 	@echo "  make profile-use            # Build optimized version"
 
-.PHONY: all clean install run-integration debug test-asan test-ubsan test-tsan release help install-deps test test-ringbuffer test-ssl test-ws integration-test integration-test-build integration-test-bitget benchmark-ssl benchmark-ssl-build test-timing test-timing-build integration-test-profile profile-generate profile-use clean-objs clean-all static-ssl example example-build ktls-build ktls-verify ktls-test ktls-benchmark
+.PHONY: all clean install run-integration debug test-asan test-ubsan test-tsan release help install-deps test test-ringbuffer test-ssl test-ws integration-test integration-test-build integration-test-bitget benchmark-ssl benchmark-ssl-build test-timing test-timing-build integration-test-profile build-release profile-generate profile-use clean-objs clean-all static-ssl example example-build ktls-build ktls-verify ktls-test ktls-benchmark

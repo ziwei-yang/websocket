@@ -2,6 +2,7 @@
 #include "ssl.h"
 #include "ringbuffer.h"
 #include "os.h"
+#include "ws_notifier.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -10,6 +11,12 @@
 #include <errno.h>
 #include <time.h>
 #include <fcntl.h>
+
+// Platform-specific random number generation
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <sys/random.h>
+#endif
 
 // #define WS_DEBUG 1
 #define WS_HTTP_BUFFER_SIZE 4096
@@ -23,12 +30,36 @@ typedef enum {
     WS_FRAME_PONG = 0xA
 } ws_frame_opcode_t;
 
+// Fast userspace PRNG for masking key generation (xoshiro128+ variant)
+typedef struct {
+    uint32_t s[4];  // 128-bit state
+} ws_prng_t;
+
+// xoshiro128+ fast PRNG - suitable for non-crypto random (masking keys)
+static inline uint32_t ws_prng_next(ws_prng_t *prng) {
+    const uint32_t result = prng->s[0] + prng->s[3];
+    const uint32_t t = prng->s[1] << 9;
+
+    prng->s[2] ^= prng->s[0];
+    prng->s[3] ^= prng->s[1];
+    prng->s[1] ^= prng->s[2];
+    prng->s[0] ^= prng->s[3];
+
+    prng->s[2] ^= t;
+    prng->s[3] = (prng->s[3] << 11) | (prng->s[3] >> 21);  // rotl(s[3], 11)
+
+    return result;
+}
+
 struct websocket_context {
     ssl_context_t *ssl;
     ringbuffer_t rx_buffer;
     ringbuffer_t tx_buffer;
     ws_on_msg_t on_msg;          // Zero-copy callback
+    ws_prng_t prng;              // Fast PRNG for masking keys (seeded once)
+    int prng_seeded;             // Flag: 1 if PRNG has been seeded
     ws_on_status_t on_status;    // Connection status callback (called once on connect)
+    ws_notifier_t *notifier;     // Optional event loop notifier (for auto WRITE event management)
 
     // Connection state: 0 = connecting, 1 = connected
     int connected;
@@ -57,6 +88,59 @@ struct websocket_context {
     uint64_t last_nic_timestamp;
     int hw_timestamping_available;
 };
+
+// Generate masking key using PRNG (seeds on first call)
+// RFC 6455 requires unpredictable masking for all client-to-server frames
+static inline uint32_t get_masking_key(websocket_context_t *ws) {
+    // Seed PRNG on first call using strong entropy source
+    if (__builtin_expect(!ws->prng_seeded, 0)) {
+        uint32_t seed[4];
+        int seed_success = 0;
+
+#ifdef __APPLE__
+        // macOS/BSD: arc4random_buf() provides strong entropy
+        arc4random_buf(seed, sizeof(seed));
+        seed_success = 1;
+#elif defined(__linux__)
+        // Linux: getrandom() provides kernel entropy
+        #ifdef SYS_getrandom
+        if (getrandom(seed, sizeof(seed), 0) == sizeof(seed)) {
+            seed_success = 1;
+        }
+        #endif
+#endif
+
+        // Fallback: /dev/urandom for seed (one-time cost)
+        if (!seed_success) {
+            int fd = open("/dev/urandom", O_RDONLY);
+            if (fd >= 0) {
+                ssize_t bytes_read = read(fd, seed, sizeof(seed));
+                close(fd);
+                if (bytes_read == sizeof(seed)) {
+                    seed_success = 1;
+                }
+            }
+        }
+
+        // Last resort: time-based seed (weak but better than nothing)
+        if (!seed_success) {
+            seed[0] = (uint32_t)time(NULL);
+            seed[1] = (uint32_t)getpid();
+            seed[2] = (uint32_t)os_get_cpu_cycle();
+            seed[3] = (uint32_t)(os_get_cpu_cycle() >> 32);
+        }
+
+        // Initialize PRNG state
+        ws->prng.s[0] = seed[0];
+        ws->prng.s[1] = seed[1];
+        ws->prng.s[2] = seed[2];
+        ws->prng.s[3] = seed[3];
+        ws->prng_seeded = 1;
+    }
+
+    // Generate masking key from fast PRNG (no syscalls!)
+    return ws_prng_next(&ws->prng);
+}
 
 uint64_t ws_get_last_recv_timestamp(websocket_context_t *ws) {
     if (!ws) return 0;
@@ -113,7 +197,11 @@ int ws_get_tx_buffer_is_mmap(websocket_context_t *ws) {
     return ringbuffer_is_mmap(&ws->tx_buffer);
 }
 
+// Base64 encoding size calculation: input N bytes → (N+2)/3*4 + 1 bytes output
+#define BASE64_ENCODE_SIZE(n) (((n) + 2) / 3 * 4 + 1)
+
 // Base64 encoding for WebSocket key (simplified)
+// IMPORTANT: output buffer must be at least BASE64_ENCODE_SIZE(len) bytes
 static void base64_encode(const uint8_t *input, char *output, size_t len) {
     const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     size_t out_len = 0;
@@ -163,6 +251,11 @@ static void generate_ws_key(char *key) {
 
 // Parse URL
 static int parse_url(const char *url, char **hostname, int *port, char **path) {
+    // Initialize outputs to NULL for cleanup on failure
+    *hostname = NULL;
+    *path = NULL;
+    *port = 0;
+
     // Simple URL parser for wss:// and ws://
     int default_port;
 
@@ -175,50 +268,85 @@ static int parse_url(const char *url, char **hostname, int *port, char **path) {
     } else {
         return -1;
     }
-    
+
     const char *colon = strchr(url, ':');
     const char *slash = strchr(url, '/');
-    
-    if (colon && colon < slash) {
+
+    if (colon && (!slash || colon < slash)) {
         size_t hostname_len = colon - url;
         *hostname = malloc(hostname_len + 1);
+        if (!*hostname) {
+            return -1;
+        }
         strncpy(*hostname, url, hostname_len);
         (*hostname)[hostname_len] = '\0';
-        
-        *port = atoi(colon + 1);
-        
+
+        // Validate port using strtol (safer than atoi)
+        char *endptr;
+        long port_val = strtol(colon + 1, &endptr, 10);
+        if (endptr == colon + 1 || (*endptr != '\0' && *endptr != '/') ||
+            port_val < 1 || port_val > 65535) {
+            free(*hostname);
+            *hostname = NULL;
+            return -1;
+        }
+        *port = (int)port_val;
+
         if (slash) {
             *path = strdup(slash);
         } else {
             *path = strdup("/");
         }
+        if (!*path) {
+            free(*hostname);
+            *hostname = NULL;
+            return -1;
+        }
     } else if (slash) {
         size_t hostname_len = slash - url;
         *hostname = malloc(hostname_len + 1);
+        if (!*hostname) {
+            return -1;
+        }
         strncpy(*hostname, url, hostname_len);
         (*hostname)[hostname_len] = '\0';
 
         *port = default_port;  // Use scheme-specific default
         *path = strdup(slash);
+        if (!*path) {
+            free(*hostname);
+            *hostname = NULL;
+            return -1;
+        }
     } else {
         *hostname = strdup(url);
+        if (!*hostname) {
+            return -1;
+        }
         *port = default_port;  // Use scheme-specific default
         *path = strdup("/");
+        if (!*path) {
+            free(*hostname);
+            *hostname = NULL;
+            return -1;
+        }
     }
-    
+
     return 0;
 }
 
 websocket_context_t *ws_init(const char *url) {
     // Allocate with cache-line alignment for optimal performance
     websocket_context_t *ws = NULL;
-    if (posix_memalign((void**)&ws, CACHE_LINE_SIZE, sizeof(websocket_context_t)) != 0) {
+    // Check both return value and pointer
+    if (posix_memalign((void**)&ws, CACHE_LINE_SIZE, sizeof(websocket_context_t)) != 0 || ws == NULL) {
         return NULL;
     }
 
     memset(ws, 0, sizeof(websocket_context_t));
-    
+
     // Parse URL
+    // parse_url handles cleanup internally on failure
     if (parse_url(url, &ws->hostname, &ws->port, &ws->path) < 0) {
         free(ws);
         return NULL;
@@ -281,10 +409,15 @@ void ws_set_on_status(websocket_context_t *ws, ws_on_status_t callback) {
 
 // Send HTTP handshake
 static int send_handshake(websocket_context_t *ws) {
+    // Key buffer must be >= BASE64_ENCODE_SIZE(16) = 25 bytes
+    // Using 32 bytes for safety margin
     char key[32];
+    _Static_assert(sizeof(key) >= BASE64_ENCODE_SIZE(16),
+                   "key buffer too small for base64-encoded 16-byte random");
     generate_ws_key(key);
-    
+
     char handshake[1024];
+    // Check snprintf return value for truncation
     int len = snprintf(handshake, sizeof(handshake),
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
@@ -294,7 +427,12 @@ static int send_handshake(websocket_context_t *ws) {
         "Sec-WebSocket-Version: 13\r\n"
         "\r\n",
         ws->path, ws->hostname, key);
-    
+
+    if (len < 0 || len >= (int)sizeof(handshake)) {
+        // Handshake too large or encoding error
+        return -1;
+    }
+
     return ssl_send(ws->ssl, (const uint8_t *)handshake, len);
 }
 
@@ -302,26 +440,27 @@ static int send_handshake(websocket_context_t *ws) {
 static int parse_http_response(websocket_context_t *ws) {
     // Look for "HTTP/1.1 200 OK" or similar
     if (ws->http_len < 12) return 0;  // Not enough data
-    
+
     // Simple check for "200" status code
     if (strncmp((char *)ws->http_buffer, "HTTP", 4) != 0) {
         return -1;
     }
-    
+
     char *status = strstr((char *)ws->http_buffer, " 200 ");
     if (!status) {
         // Check for 101 Switching Protocols
         status = strstr((char *)ws->http_buffer, " 101 ");
         if (!status) return -1;
     }
-    
-    // Look for Upgrade: websocket (case-insensitive check)
-    // HTTP headers are case-insensitive, so check for both
-    if (strstr((char *)ws->http_buffer, "Upgrade: websocket") == NULL &&
-        strstr((char *)ws->http_buffer, "upgrade: websocket") == NULL) {
+
+    // Case-insensitive header parsing (HTTP headers are case-insensitive per RFC 7230)
+    // Check common capitalizations for portability (strcasestr is GNU extension)
+    if (strstr((char *)ws->http_buffer, "upgrade: websocket") == NULL &&
+        strstr((char *)ws->http_buffer, "Upgrade: websocket") == NULL &&
+        strstr((char *)ws->http_buffer, "Upgrade: WebSocket") == NULL) {
         return -1;
     }
-    
+
     return 1;  // Handshake complete
 }
 
@@ -347,6 +486,11 @@ static int parse_ws_frame_zero_copy(websocket_context_t *ws, size_t available, u
         if (data_len < 4) return 0;
         payload_len_raw = (data_ptr[2] << 8) | data_ptr[3];
         header_len = 4;
+
+        // RFC 6455 Section 5.2: Extended length MUST NOT be used for <= 125 bytes
+        if (__builtin_expect(payload_len_raw <= 125, 0)) {
+            return -1;  // Protocol violation
+        }
     } else if (payload_len_raw == 127) {
         if (data_len < 10) return 0;
         payload_len_raw = ((uint64_t)data_ptr[2] << 56) | ((uint64_t)data_ptr[3] << 48) |
@@ -354,6 +498,11 @@ static int parse_ws_frame_zero_copy(websocket_context_t *ws, size_t available, u
                           ((uint64_t)data_ptr[6] << 24) | ((uint64_t)data_ptr[7] << 16) |
                           ((uint64_t)data_ptr[8] << 8) | data_ptr[9];
         header_len = 10;
+
+        // RFC 6455 Section 5.2: 64-bit length MUST NOT be used for <= 65535 bytes
+        if (__builtin_expect(payload_len_raw <= 65535, 0)) {
+            return -1;  // Protocol violation
+        }
     }
 
     // Check if complete frame is available
@@ -442,20 +591,22 @@ static inline void handle_http_stage(websocket_context_t *ws) {
 
 // Send PONG frame in response to PING (RFC 6455 Section 5.5.2)
 static inline void send_pong_frame(websocket_context_t *ws, const uint8_t *ping_payload, size_t ping_len) {
+    // Don't send PONG if connection is already closed (after CLOSE handshake)
+    if (ws->closed) return;
+
+    // RFC 6455 Section 5.5: Control frames MUST have payload <= 125 bytes
+    // Receiving oversized PING is a protocol violation - close connection
+    if (__builtin_expect(ping_len > 125, 0)) {
+        ws->closed = 1;
+        return;
+    }
+
     // PONG frame: FIN=1, opcode=0xA (PONG)
-    uint8_t frame[14];
+    uint8_t frame[2 + 125];  // Max control frame size
     size_t frame_len = 2;
 
     frame[0] = 0x8A;  // FIN + PONG frame
-    frame[1] = ping_len & 0x7F;  // Payload length (control frames must be <= 125 bytes)
-
-    // Extended length for payloads > 125 bytes (rare for PING)
-    if (ping_len > 125) {
-        frame[1] = 126;
-        frame[2] = (ping_len >> 8) & 0xFF;
-        frame[3] = ping_len & 0xFF;
-        frame_len = 4;
-    }
+    frame[1] = ping_len & 0x7F;  // Payload length (always <= 125 for control frames)
 
     size_t total_size = frame_len + ping_len;
 
@@ -472,8 +623,82 @@ static inline void send_pong_frame(websocket_context_t *ws, const uint8_t *ping_
         }
         ringbuffer_commit_write(&ws->tx_buffer, total_size);
         ws->has_pending_tx = 1;
+
+        // Auto-register WRITE event if notifier is set (Option 3)
+        if (ws->notifier) {
+            int fd = ws_get_fd(ws);
+            if (fd >= 0) {
+                ws_notifier_mod(ws->notifier, fd, WS_EVENT_READ | WS_EVENT_WRITE);
+            }
+        }
     }
     // If no space, silently drop (control frames are best-effort in tight loops)
+}
+
+// Send CLOSE frame in response to server-initiated CLOSE (RFC 6455 Section 5.5.1)
+static inline void send_close_response(websocket_context_t *ws, const uint8_t *close_payload, size_t close_len) {
+    // Don't send multiple CLOSE responses (RFC 6455: only respond once)
+    if (ws->closed) return;
+
+    // RFC 6455 Section 5.5: Control frames MUST have payload <= 125 bytes
+    if (__builtin_expect(close_len > 125, 0)) {
+        ws->closed = 1;
+        return;
+    }
+
+    // CLOSE frame: FIN=1, opcode=0x8 (CLOSE), masked
+    // Frame format: 2-byte header + 4-byte mask + payload (status code if present)
+    uint8_t frame[6 + 125];  // Header + mask + max control payload
+    size_t frame_len = 2;
+
+    frame[0] = 0x88;  // FIN + CLOSE opcode
+
+    // Determine payload length (echo back status code if provided)
+    size_t response_len = (close_len >= 2) ? 2 : 0;  // Echo status code only, no reason text
+    frame[1] = 0x80 | (response_len & 0x7F);  // MASK=1 + length
+
+    // Generate unpredictable 4-byte masking key (RFC 6455 requirement)
+    uint32_t mask_word = get_masking_key(ws);
+    uint8_t mask[4];
+    mask[0] = (mask_word >> 0) & 0xFF;
+    mask[1] = (mask_word >> 8) & 0xFF;
+    mask[2] = (mask_word >> 16) & 0xFF;
+    mask[3] = (mask_word >> 24) & 0xFF;
+
+    memcpy(frame + 2, mask, 4);
+    frame_len += 4;
+
+    // Copy and mask status code if present
+    if (response_len >= 2) {
+        frame[6] = close_payload[0] ^ mask[0];
+        frame[7] = close_payload[1] ^ mask[1];
+        frame_len += 2;
+    }
+
+    size_t total_size = frame_len;
+
+    // Write to TX buffer
+    uint8_t *write_ptr = NULL;
+    size_t available = 0;
+    ringbuffer_get_write_ptr(&ws->tx_buffer, &write_ptr, &available);
+
+    if (available >= total_size) {
+        memcpy(write_ptr, frame, total_size);
+        ringbuffer_commit_write(&ws->tx_buffer, total_size);
+        ws->has_pending_tx = 1;
+
+        // Auto-register WRITE event if notifier is set (Option 3)
+        if (ws->notifier) {
+            int fd = ws_get_fd(ws);
+            if (fd >= 0) {
+                ws_notifier_mod(ws->notifier, fd, WS_EVENT_READ | WS_EVENT_WRITE);
+            }
+        }
+    }
+
+    // Mark connection as closed per RFC 6455 closing handshake
+    ws->connected = 0;
+    ws->closed = 1;
 }
 
 // Handle WebSocket data stage - HFT hot path (assume always connected)
@@ -494,7 +719,12 @@ static inline void handle_ws_stage(websocket_context_t *ws) {
                 send_pong_frame(ws, payload_ptr, payload_len);
             }
 
-            // Pass all frames to callback (application can see PINGs/PONGs for monitoring)
+            // Handle CLOSE frames automatically (RFC 6455 Section 5.5.1: MUST respond with CLOSE)
+            if (opcode == WS_FRAME_CLOSE) {
+                send_close_response(ws, payload_ptr, payload_len);
+            }
+
+            // Pass all frames to callback (application can see PINGs/PONGs/CLOSEs for monitoring)
             if (ws->on_msg) {
                 ws->on_msg(ws, payload_ptr, payload_len, opcode);
             }
@@ -525,7 +755,8 @@ int ws_update(websocket_context_t *ws) {
                 handle_http_stage(ws);
             }
         } else if (ssl_status == -1) {
-            // SSL handshake failed - notify application via status callback
+            // SSL handshake failed - mark as closed and notify application
+            ws->closed = 1;
             if (ws->on_status) ws->on_status(ws, -1);
             return -1;
         }
@@ -555,6 +786,15 @@ int ws_update(websocket_context_t *ws) {
         // Clear flag if TX buffer is now empty
         if (ringbuffer_available_read(&ws->tx_buffer) == 0) {
             ws->has_pending_tx = 0;
+
+            // Auto-unregister WRITE event if notifier is set (Option 3)
+            if (ws->notifier) {
+                int fd = ws_get_fd(ws);
+                if (fd >= 0) {
+                    // Unregister WRITE, keep only READ event
+                    ws_notifier_mod(ws->notifier, fd, WS_EVENT_READ);
+                }
+            }
         }
     }
 
@@ -591,11 +831,15 @@ int ws_send(websocket_context_t *ws, const uint8_t *data, size_t len) {
         frame_len = 10;
     }
 
-    // Generate 4-byte masking key (RFC 6455 Section 5.3)
+    // Generate unpredictable masking key (RFC 6455 Section 5.3)
+    // Uses fast userspace PRNG seeded with strong entropy
+    uint32_t mask_word = get_masking_key(ws);
     uint8_t mask[4];
-    for (int i = 0; i < 4; i++) {
-        mask[i] = (uint8_t)(rand() & 0xFF);
-    }
+    mask[0] = (mask_word >> 0) & 0xFF;
+    mask[1] = (mask_word >> 8) & 0xFF;
+    mask[2] = (mask_word >> 16) & 0xFF;
+    mask[3] = (mask_word >> 24) & 0xFF;
+
     memcpy(frame + frame_len, mask, 4);
     frame_len += 4;
 
@@ -623,9 +867,10 @@ int ws_send(websocket_context_t *ws, const uint8_t *data, size_t len) {
             if (__builtin_expect(available < len, 0)) {
                 return -1;  // Not enough space for payload
             }
-            // Apply masking: masked_data[i] = data[i] XOR mask[i % 4]
+            // Apply masking: masked_data[i] = data[i] XOR mask[i & 3]
+            // Use bitwise AND instead of modulo for performance (i % 4 == i & 3)
             for (size_t i = 0; i < len; i++) {
-                write_ptr[i] = data[i] ^ mask[i % 4];
+                write_ptr[i] = data[i] ^ mask[i & 3];
             }
             ringbuffer_commit_write(&ws->tx_buffer, len);
         } else {
@@ -634,9 +879,10 @@ int ws_send(websocket_context_t *ws, const uint8_t *data, size_t len) {
     } else {
         // Likely: enough contiguous space - write both frame and data in one go
         memcpy(write_ptr, frame, frame_len);
-        // Apply masking to payload: masked_data[i] = data[i] XOR mask[i % 4]
+        // Apply masking to payload: masked_data[i] = data[i] XOR mask[i & 3]
+        // Use bitwise AND instead of modulo for performance (i % 4 == i & 3)
         for (size_t i = 0; i < len; i++) {
-            write_ptr[frame_len + i] = data[i] ^ mask[i % 4];
+            write_ptr[frame_len + i] = data[i] ^ mask[i & 3];
         }
         ringbuffer_commit_write(&ws->tx_buffer, total_size);
     }
@@ -644,16 +890,119 @@ int ws_send(websocket_context_t *ws, const uint8_t *data, size_t len) {
     // Optimization #8: Mark that we have pending TX data
     ws->has_pending_tx = 1;
 
+    // Auto-register WRITE event if notifier is set (Option 3)
+    if (ws->notifier) {
+        int fd = ws_get_fd(ws);
+        if (fd >= 0) {
+            // Register both READ and WRITE events
+            ws_notifier_mod(ws->notifier, fd, WS_EVENT_READ | WS_EVENT_WRITE);
+        }
+    }
+
     return len;
 }
 
-void ws_close(websocket_context_t *ws) {
-    if (ws) {
-        ws->connected = 0;
-        ws->closed = 1;
-        // Note: Socket fd is not closed here - it will be closed in ws_free()
-        // This allows any buffered data to be processed before cleanup
+// Connect websocket context to event loop notifier for automatic WRITE event management
+void ws_set_notifier(websocket_context_t *ws, ws_notifier_t *notifier) {
+    if (!ws) return;
+    ws->notifier = notifier;
+}
+
+// Query if TX buffer has pending data (for manual event management)
+int ws_wants_write(websocket_context_t *ws) {
+    if (!ws) return 0;
+    return ws->has_pending_tx;
+}
+
+// Flush TX buffer immediately without waiting for event loop (Option 3)
+// Returns 0 on success, -1 on error
+int ws_flush_tx(websocket_context_t *ws) {
+    if (!ws || !ws->connected) return -1;
+
+    // Only flush if we have pending data
+    if (!ws->has_pending_tx) return 0;
+
+    size_t tx_available = ringbuffer_available_read(&ws->tx_buffer);
+    if (tx_available > 0) {
+        uint8_t *read_ptr = NULL;
+        size_t read_len = 0;
+        ringbuffer_next_read(&ws->tx_buffer, &read_ptr, &read_len);
+        if (read_len > 0) {
+            if (read_len > 4096) read_len = 4096;
+            int sent = ssl_send(ws->ssl, read_ptr, read_len);
+            if (sent > 0) {
+                ringbuffer_advance_read(&ws->tx_buffer, sent);
+            } else if (sent < 0) {
+                return -1;  // Error occurred
+            }
+        }
     }
+
+    // Clear flag if TX buffer is now empty
+    if (ringbuffer_available_read(&ws->tx_buffer) == 0) {
+        ws->has_pending_tx = 0;
+
+        // Auto-unregister WRITE event if notifier is set (Option 3)
+        if (ws->notifier) {
+            int fd = ws_get_fd(ws);
+            if (fd >= 0) {
+                ws_notifier_mod(ws->notifier, fd, WS_EVENT_READ);
+            }
+        }
+    }
+
+    return 0;
+}
+
+void ws_close(websocket_context_t *ws) {
+    if (!ws || ws->closed) return;
+
+    // Send WebSocket CLOSE frame (RFC 6455 Section 5.5.1)
+    // This ensures proper closing handshake and avoids exchange penalties
+    uint8_t frame[8];  // 2-byte header + 4-byte mask + 2-byte status code
+    frame[0] = 0x88;   // FIN + CLOSE opcode
+    frame[1] = 0x80 | 2;  // MASK=1, length=2 (status code only)
+
+    // Generate unpredictable 4-byte masking key (RFC 6455 requirement)
+    uint32_t mask_word = get_masking_key(ws);
+    uint8_t mask[4];
+    mask[0] = (mask_word >> 0) & 0xFF;
+    mask[1] = (mask_word >> 8) & 0xFF;
+    mask[2] = (mask_word >> 16) & 0xFF;
+    mask[3] = (mask_word >> 24) & 0xFF;
+
+    memcpy(frame + 2, mask, 4);
+
+    // Status code 1000 = Normal Closure (big-endian), then apply mask
+    uint8_t status_bytes[2];
+    status_bytes[0] = (1000 >> 8) & 0xFF;
+    status_bytes[1] = 1000 & 0xFF;
+    frame[6] = status_bytes[0] ^ mask[0];
+    frame[7] = status_bytes[1] ^ mask[1];
+
+    // Write to TX buffer (best-effort, silent drop if full)
+    uint8_t *write_ptr = NULL;
+    size_t available = 0;
+    ringbuffer_get_write_ptr(&ws->tx_buffer, &write_ptr, &available);
+
+    if (available >= sizeof(frame)) {
+        memcpy(write_ptr, frame, sizeof(frame));
+        ringbuffer_commit_write(&ws->tx_buffer, sizeof(frame));
+        ws->has_pending_tx = 1;
+
+        // Auto-register WRITE event if notifier is set
+        if (ws->notifier) {
+            int fd = ws_get_fd(ws);
+            if (fd >= 0) {
+                ws_notifier_mod(ws->notifier, fd, WS_EVENT_READ | WS_EVENT_WRITE);
+            }
+        }
+    }
+
+    ws->connected = 0;
+    ws->closed = 1;
+    // Note: Socket fd is not closed here - it will be closed in ws_free()
+    // This allows buffered CLOSE frame to be transmitted before cleanup
 }
 
 ws_state_t ws_get_state(websocket_context_t *ws) {
