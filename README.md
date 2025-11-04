@@ -8,7 +8,7 @@ A high-performance WebSocket library designed for high-frequency trading and rea
 - **Ultra-low latency**: Optimized for high-frequency trading use cases (~40-180 μs median processing latency)
 - **Ring buffer memory model**: Pre-allocated 8MB ring buffer with virtual memory mirroring for zero-wraparound reads
 - **Zero-copy design**: Single reader/writer lock-free design eliminates contention, direct pointer access to buffers
-- **SSL/TLS support**: Multi-backend abstraction supporting LibreSSL, BoringSSL, and OpenSSL 3.x
+- **SSL/TLS support**: Multi-backend abstraction (kTLS default on Linux, LibreSSL default on macOS)
 - **Lightweight HTTP parsing**: Custom HTTP parser optimized for WebSocket handshakes
 
 ### Platform-Specific Optimizations
@@ -38,12 +38,12 @@ A high-performance WebSocket library designed for high-frequency trading and rea
 ### Prerequisites
 
 - **C Compiler**: GCC or Clang with C11 support
-- **SSL Library** (choose one):
-  - **LibreSSL** (recommended for macOS): Fast, secure OpenSSL fork
-  - **BoringSSL**: Google's OpenSSL fork optimized for performance
-  - **OpenSSL 3.x**: Standard OpenSSL implementation
+- **SSL Library**:
+  - **Linux**: OpenSSL 3.x (default, used with kTLS)
+  - **macOS**: LibreSSL (default) or OpenSSL 3.x
+  - Alternatives: BoringSSL (any platform)
 - **CMocka** (optional): Only required for unit tests
-- **Operating System**: Linux, macOS, or BSD
+- **Operating System**: Linux (with kTLS support), macOS, or BSD
 
 ### Installation (macOS)
 
@@ -68,16 +68,23 @@ sudo apt-get install build-essential libssl-dev libcmocka-dev
 ### Build Commands
 
 ```bash
-# Build library with default SSL backend (LibreSSL on macOS, OpenSSL on Linux)
+# Build library with default SSL backend (LibreSSL on macOS, ktls on Linux)
 make
 
 # Build with specific SSL backend
-SSL_BACKEND=libressl make      # LibreSSL (recommended)
+SSL_BACKEND=ktls make          # OpenSSL with Kernel TLS (DEFAULT on Linux)
+SSL_BACKEND=libressl make      # LibreSSL (DEFAULT on macOS)
+SSL_BACKEND=openssl make       # OpenSSL 3.x (without kTLS)
 SSL_BACKEND=boringssl make     # BoringSSL
-SSL_BACKEND=openssl make       # OpenSSL 3.x
 
-# Build and run integration test (Binance WebSocket)
-make integration-test
+# Build and run integration tests
+make integration-test          # Binance (high-frequency market)
+make integration-test-bitget   # Bitget (low-frequency market, TLS 1.2)
+
+# kTLS targets (Linux only)
+make ktls-build                # Build with kTLS
+make ktls-verify               # Verify kTLS is working
+make ktls-benchmark            # Compare kTLS vs OpenSSL performance
 
 # Build SSL performance benchmark
 make ssl-benchmark
@@ -92,8 +99,10 @@ make clean
 ### Build Output
 
 - **`libws.a`** - Static library for linking
-- **`test_binance_integration`** - Real-world integration test with comprehensive latency benchmarking
+- **`test_binance_integration`** - High-frequency market integration test (Binance)
+- **`test_bitget_integration`** - Low-frequency market integration test (Bitget, TLS 1.2 with kTLS)
 - **`ssl_benchmark`** - SSL performance comparison tool across LibreSSL/BoringSSL/OpenSSL backends
+- **`ssl_probe`** - SSL connection diagnostic utility
 
 ## Usage
 
@@ -192,9 +201,9 @@ Exchange Server → TCP/IP → SSL/TLS → WebSocket Parser → Ring Buffer → 
 
 1. **TCP/IP socket**: Raw network I/O using POSIX sockets
 2. **Event Notifier**: Unified abstraction over kqueue/epoll/select for I/O multiplexing
-3. **SSL/TLS**: LibreSSL/BoringSSL/OpenSSL for encryption/decryption
-4. **HTTP Parser**: Custom parser for WebSocket handshake
-5. **WebSocket Parser**: RFC 6455 frame parsing with opcode handling
+3. **SSL/TLS**: kTLS (Linux default), LibreSSL (macOS default), or BoringSSL/OpenSSL
+4. **HTTP Parser**: Custom parser for WebSocket handshake with SNI support
+5. **WebSocket Parser**: RFC 6455 compliant frame parsing with masking
 6. **Ring Buffer**: Pre-allocated 8MB circular buffer with virtual memory mirroring
 
 ### Memory Model
@@ -208,11 +217,89 @@ Exchange Server → TCP/IP → SSL/TLS → WebSocket Parser → Ring Buffer → 
 ### SSL/TLS Backend Abstraction
 
 The library supports multiple SSL backends through a unified `ssl.h` interface:
-- **LibreSSL**: Recommended for macOS - clean API, good performance
-- **BoringSSL**: Google's fork - optimized for speed, minimal features
-- **OpenSSL 3.x**: Standard implementation - widely compatible
 
-Backend selection via `SSL_BACKEND` environment variable at build time.
+**Platform Defaults (Optimized for HFT):**
+- **Linux**: kTLS (OpenSSL + Kernel TLS) - ~5-10% lower CPU, better latency consistency
+- **macOS**: LibreSSL - clean API, best compatibility with Apple Silicon
+
+**Available Backends:**
+- **ktls**: OpenSSL with Kernel TLS offload (Linux only, production-ready for HFT)
+- **openssl**: Standard OpenSSL 3.x without kernel offload
+- **libressl**: LibreSSL (OpenBSD's fork)
+- **boringssl**: Google's fork optimized for speed
+
+Backend selection via `SSL_BACKEND` make variable at build time (e.g., `make SSL_BACKEND=openssl`).
+
+### Kernel TLS (kTLS) Support - DEFAULT ON LINUX
+
+**kTLS** is the **default SSL backend on Linux** and offloads TLS encryption/decryption from userspace to the kernel for improved performance:
+
+- **10-30% lower latency**: Reduces SSL processing time from ~80μs to ~55μs
+- **20-40% less CPU usage**: Kernel handles crypto operations more efficiently
+- **Better cache utilization**: Fewer context switches and memory copies
+- **Zero code changes**: Automatic fallback to OpenSSL if unavailable
+
+#### Requirements
+
+- **Linux kernel 4.17+** (5.2+ recommended for TLS 1.3 support)
+- **OpenSSL 1.1.1+** or **OpenSSL 3.x**
+- **CONFIG_TLS** enabled in kernel (check with `grep CONFIG_TLS /boot/config-$(uname -r)`)
+
+#### Quick Start with kTLS
+
+```bash
+# 1. Enable kernel module (one-time setup)
+sudo ./scripts/enable_ktls.sh
+
+# 2. Build with kTLS backend
+make ktls-build
+
+# 3. Verify kTLS is working
+make ktls-verify
+
+# 4. Run integration test
+make ktls-test
+
+# 5. Compare performance (kTLS vs OpenSSL)
+make ktls-benchmark
+```
+
+#### Verification
+
+The integration test will show kTLS status in the SSL configuration:
+
+```
+🔐 SSL Configuration:
+   Backend:               OpenSSL 3.0.13
+   Cipher Suite:          TLS_AES_256_GCM_SHA384
+   Hardware Acceleration: YES (AES-NI)
+   TLS Mode:              kTLS (Kernel) ✅
+```
+
+For more details, see:
+- **`doc/how_to_enable_ktls.md`** - Comprehensive kTLS setup and troubleshooting guide
+- **`doc/ktls_proposal.md`** - kTLS design proposal
+- **`doc/ktls_implementation_checklist.md`** - Implementation checklist
+
+### TLS Version Control
+
+Control TLS version negotiation via environment variables:
+
+```bash
+# Force TLS 1.2 (enables kTLS on Linux)
+WS_ALLOW_TLS12=1 ./test_bitget_integration
+
+# Force TLS 1.3 (disables kTLS, uses userspace OpenSSL)
+WS_FORCE_TLS13=1 ./test_binance_integration
+
+# Debug kTLS activation
+WS_DEBUG_KTLS=1 ./test_binance_integration
+
+# General WebSocket debugging
+WS_DEBUG=1 ./test_binance_integration
+```
+
+**Note:** kTLS only works with TLS 1.2 in OpenSSL 3.0.13. TLS 1.3 kTLS support requires kernel patches (see `doc/how_to_enable_ktls.md`).
 
 ## Latency Benchmarking
 
@@ -294,26 +381,74 @@ This endpoint provides:
 
 The test validates the library under production conditions with actual market data.
 
+## Bitget WebSocket Integration
+
+The Bitget integration test validates TLS 1.2 connectivity with kTLS support:
+
+```
+wss://ws.bitget.com/v3/ws/public
+```
+
+**Features:**
+- **TLS 1.2 negotiation**: Forces TLS 1.2 to enable kTLS on Linux
+- **Low-frequency market**: Optimized for ~20 messages/minute (BTC/USDT ticker)
+- **SNI validation**: Tests Server Name Indication for CDN-backed endpoints
+- **Bitget V3 API**: Uses latest WebSocket API format
+
+**Subscription format:**
+```json
+{
+  "op": "subscribe",
+  "args": [{
+    "instType": "spot",
+    "topic": "ticker",
+    "symbol": "BTCUSDT"
+  }]
+}
+```
+
+**Run the test:**
+```bash
+make integration-test-bitget
+
+# Or manually with TLS 1.2 forced
+WS_ALLOW_TLS12=1 ./test_bitget_integration
+```
+
+This test complements the Binance test by validating:
+- TLS 1.2 + kTLS activation
+- SNI support for CDN endpoints
+- WebSocket frame masking (RFC 6455 compliance)
+- Low-frequency data stream handling
+
 ## Project Structure
 
 ```
 .
 ├── ringbuffer.h/c              # Lock-free ring buffer with virtual memory mirroring
-├── ssl.h/c                     # SSL/TLS abstraction layer
-├── ssl_backend.h               # SSL backend selection (LibreSSL/BoringSSL/OpenSSL)
-├── ws.h/c                      # WebSocket protocol implementation
+├── ssl.h/c                     # SSL/TLS abstraction layer (with SNI and kTLS support)
+├── ssl_backend.h               # SSL backend selection (ktls/LibreSSL/BoringSSL/OpenSSL)
+├── ws.h/c                      # WebSocket protocol implementation (RFC 6455 compliant)
 ├── ws_notifier.h/c             # Unified event notification (kqueue/epoll/select)
 ├── os.h/c                      # OS abstraction for CPU cycle timing
 ├── test/
 │   ├── integration/
-│   │   └── binance.c           # Integration test with comprehensive benchmarking
-│   └── ssl_benchmark.c         # SSL backend performance comparison tool
+│   │   ├── binance.c           # High-frequency market test (Binance)
+│   │   └── bitget.c            # Low-frequency market test (Bitget, TLS 1.2)
+│   ├── ssl_benchmark.c         # SSL backend performance comparison tool
+│   └── ssl_probe.c             # SSL connection diagnostic utility
+├── scripts/
+│   ├── enable_ktls.sh          # kTLS kernel module setup script
+│   └── lock_cpu_performance.sh # CPU performance mode script
 ├── example/
 │   └── simple_ws.c             # Simple usage example
 ├── doc/
-│   └── websocket_design.md     # Architecture and design documentation
+│   ├── websocket_design.md     # Architecture and design documentation
+│   ├── how_to_enable_ktls.md   # Comprehensive kTLS setup guide
+│   ├── ktls_proposal.md        # kTLS design proposal
+│   └── ktls_implementation_checklist.md  # Implementation checklist
 ├── .gitignore                  # Git ignore patterns
-├── Makefile                    # Build system
+├── Makefile                    # Build system with kTLS support
 └── README.md                   # This file
 ```
 

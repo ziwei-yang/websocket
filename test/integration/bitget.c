@@ -11,11 +11,11 @@
 #include <inttypes.h>
 #include <math.h>
 
-#define NUM_RUNS 5
-#define WARMUP_MESSAGES 100          // Warm up with 100 messages per run
-#define STATS_MESSAGES 300           // Messages collected for statistics per run
+#define NUM_RUNS 1
+#define WARMUP_MESSAGES 5            // Warm up with 5 messages (Bitget low-frequency market)
+#define STATS_MESSAGES 15            // Messages collected for statistics per run
 #define MESSAGES_PER_RUN (WARMUP_MESSAGES + STATS_MESSAGES)
-#define MAX_MESSAGES (NUM_RUNS * MESSAGES_PER_RUN)
+#define MAX_MESSAGES (NUM_RUNS * MESSAGES_PER_RUN)  // Total: 1 * 20 = 20 messages (~1 minute)
 
 // Timing record for each message - pre-allocated to avoid I/O during measurement
 typedef struct {
@@ -29,12 +29,14 @@ typedef struct {
 
 static int running = 1;
 static int connected = 0;
+static int subscribed = 0;
 static int message_count = 0;
 static int runs_reported = 0;
 static timing_record_t timing_records[MAX_MESSAGES];
 static int hw_timestamping_available = 0;
 
 void on_message(websocket_context_t *ws, const uint8_t *payload_ptr, size_t payload_len, uint8_t opcode) {
+    (void)ws;
     (void)payload_ptr;
 
     // Return if we've collected enough samples
@@ -73,10 +75,42 @@ void on_message(websocket_context_t *ws, const uint8_t *payload_ptr, size_t payl
 }
 
 void on_status(websocket_context_t *ws, int status) {
-    (void)ws;
     if (status == 0) {
         printf("✅ WebSocket connected successfully!\n");
         connected = 1;
+
+        // Send subscription message immediately after connection
+        // Using Bitget V3 API format with trade stream for high-frequency messages
+        // Trade stream provides real-time individual trades (similar to Binance @trade)
+        const char *subscribe_msg = "{"
+            "\"op\": \"subscribe\","
+            "\"args\": ["
+                "{"
+                    "\"instType\": \"spot\","
+                    "\"topic\": \"trade\","
+                    "\"symbol\": \"BTCUSDT\""
+                "}"
+            "]"
+        "}";
+
+        printf("📨 Sending subscription message...\n");
+        // Retry a few times in case the socket isn't immediately ready
+        int sent = -1;
+        for (int retry = 0; retry < 10 && sent != 0; retry++) {
+            sent = ws_send(ws, (const uint8_t *)subscribe_msg, strlen(subscribe_msg));
+            if (sent != 0) {
+                usleep(10000);  // Wait 10ms before retry
+            }
+        }
+
+        if (sent == 0) {
+            printf("✅ Subscription message sent\n");
+            subscribed = 1;
+        } else {
+            printf("⚠️  Send returned non-zero, data may be queued (continuing...)\n");
+            // Don't exit - ws_send() queues data, ws_update() flushes it
+            subscribed = 1;  // Mark as sent anyway
+        }
     } else {
         ws_state_t state = ws_get_state(ws);
         printf("⚠️  WebSocket status change: %d (state: %d)\n", status, state);
@@ -407,7 +441,7 @@ void signal_handler(int sig) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *url = "wss://stream.binance.com:443/stream?streams=btcusdt@trade&timeUnit=MICROSECOND";
+    const char *url = "wss://ws.bitget.com/v3/ws/public";
     int use_cpu_affinity = 0;
     int use_realtime_priority = 0;
     int use_time_constraint = 0;
@@ -446,8 +480,8 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    printf("Binance WebSocket Integration Test (Enhanced)\n");
-    printf("==============================================\n\n");
+    printf("Bitget WebSocket Integration Test (Low-Frequency Market)\n");
+    printf("==========================================================\n\n");
 
     // Environment verification if requested
     if (verify_environment) {
@@ -472,7 +506,7 @@ int main(int argc, char *argv[]) {
             printf("   ✅ Real-time priority set successfully\n");
         } else {
             printf("   ⚠️  Real-time priority failed (requires privileges)\n");
-            printf("   💡 Try: sudo ./test_binance_integration --rt-priority %d\n", rt_priority);
+            printf("   💡 Try: sudo ./test_bitget_integration --rt-priority %d\n", rt_priority);
         }
     }
 
@@ -491,7 +525,7 @@ int main(int argc, char *argv[]) {
                    (unsigned long long)constraint);
         } else {
             printf("   ⚠️  Time-constraint policy failed (requires root)\n");
-            printf("   💡 Try: sudo ./test_binance_integration --time-constraint\n");
+            printf("   💡 Try: sudo ./test_bitget_integration --time-constraint\n");
         }
     }
 #else
@@ -500,14 +534,15 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
-    printf("\nConnecting to: %s\n\n", url);
-    
+    printf("\nConnecting to: %s\n", url);
+    printf("📋 Using TLS 1.2 with kTLS for best performance (~20 msgs/min)\n\n");
+
     websocket_context_t *ws = ws_init(url);
     if (!ws) {
         fprintf(stderr, "❌ Failed to initialize WebSocket\n");
         return 1;
     }
-    
+
     ws_set_on_msg(ws, on_message);
     ws_set_on_status(ws, on_status);
 
@@ -570,8 +605,15 @@ int main(int argc, char *argv[]) {
     }
 
     // Wait for connection and register fd (one-time setup)
+    printf("⏳ Waiting for connection...\n");
+    int connection_attempts = 0;
     while (running && !connected) {
         ws_update(ws);
+        if (++connection_attempts % 1000 == 0) {
+            printf("   Still connecting... (attempt %d, state=%d)\n",
+                   connection_attempts, ws_get_state(ws));
+        }
+        usleep(1000);  // 1ms delay to avoid busy loop
     }
 
     if (connected) {

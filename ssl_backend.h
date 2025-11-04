@@ -44,9 +44,10 @@
 
 #ifdef SSL_BACKEND_KTLS
 #define SSL_BACKEND_NAME "Kernel TLS"
-// kTLS requires OpenSSL for handshake
+// kTLS requires OpenSSL for handshake, so also define OpenSSL backend
 #ifndef SSL_BACKEND_OPENSSL
-#define SSL_BACKEND_OPENSSL_FOR_HANDSHAKE 1
+#define SSL_BACKEND_OPENSSL 1
+#define SSL_BACKEND_OPENSSL_FOR_KTLS 1
 #endif
 #endif
 

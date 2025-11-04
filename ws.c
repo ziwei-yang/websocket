@@ -88,6 +88,11 @@ const char* ws_get_cipher_name(websocket_context_t *ws) {
     return ssl_get_cipher_name(ws->ssl);
 }
 
+const char* ws_get_tls_mode(websocket_context_t *ws) {
+    if (!ws || !ws->ssl) return "Unknown";
+    return ssl_get_tls_mode(ws->ssl);
+}
+
 int ws_get_rx_buffer_is_mirrored(websocket_context_t *ws) {
     if (!ws) return 0;
     return ringbuffer_is_mirrored(&ws->rx_buffer);
@@ -310,8 +315,10 @@ static int parse_http_response(websocket_context_t *ws) {
         if (!status) return -1;
     }
     
-    // Look for Upgrade: websocket
-    if (strstr((char *)ws->http_buffer, "Upgrade: websocket") == NULL) {
+    // Look for Upgrade: websocket (case-insensitive check)
+    // HTTP headers are case-insensitive, so check for both
+    if (strstr((char *)ws->http_buffer, "Upgrade: websocket") == NULL &&
+        strstr((char *)ws->http_buffer, "upgrade: websocket") == NULL) {
         return -1;
     }
     
@@ -415,9 +422,20 @@ static inline void handle_http_stage(websocket_context_t *ws) {
     int ret = ssl_recv(ws->ssl, ws->http_buffer + ws->http_len, space_available);
     if (ret > 0) {
         ws->http_len += ret;
-        if (parse_http_response(ws) == 1) {
+        int parse_result = parse_http_response(ws);
+        if (parse_result == 1) {
             ws->connected = 1;
             if (ws->on_status) ws->on_status(ws, 0);
+        } else if (parse_result == -1) {
+            // HTTP handshake failed (non-101 response)
+            // Print the response for debugging
+            const char *debug_env = getenv("WS_DEBUG");
+            if (debug_env && atoi(debug_env) == 1 && ws->http_len > 0) {
+                fprintf(stderr, "WebSocket handshake failed. HTTP response:\n%.*s\n",
+                        (int)ws->http_len, ws->http_buffer);
+            }
+            ws->closed = 1;  // Mark as closed to indicate error
+            if (ws->on_status) ws->on_status(ws, -1);
         }
     }
 }
@@ -546,21 +564,40 @@ int ws_update(websocket_context_t *ws) {
 int ws_send(websocket_context_t *ws, const uint8_t *data, size_t len) {
     if (__builtin_expect(!ws || !ws->connected, 0)) return -1;  // Unlikely: validation
 
-    // Create WebSocket frame header
+    // Create WebSocket frame header with masking (RFC 6455 Section 5.1)
+    // Client-to-server frames MUST be masked
     uint8_t frame[14];
     size_t frame_len = 2;
 
     frame[0] = 0x81;  // FIN + TEXT frame
-    frame[1] = len & 0x7F;
 
-    // Likely: market data and typical messages are >125 bytes
-    if (__builtin_expect(len > 125, 1)) {
-        // Extended payload length
-        frame[1] = 126;
+    // Set length field with MASK bit (bit 7)
+    if (len <= 125) {
+        frame[1] = 0x80 | (len & 0x7F);  // MASK=1 | length
+        frame_len = 2;
+    } else if (len <= 65535) {
+        frame[1] = 0x80 | 126;  // MASK=1 | 126 (extended payload)
         frame[2] = (len >> 8) & 0xFF;
         frame[3] = len & 0xFF;
         frame_len = 4;
+    } else {
+        frame[1] = 0x80 | 127;  // MASK=1 | 127 (64-bit length)
+        // Write 64-bit length (big-endian)
+        frame[2] = 0; frame[3] = 0; frame[4] = 0; frame[5] = 0;
+        frame[6] = (len >> 24) & 0xFF;
+        frame[7] = (len >> 16) & 0xFF;
+        frame[8] = (len >> 8) & 0xFF;
+        frame[9] = len & 0xFF;
+        frame_len = 10;
     }
+
+    // Generate 4-byte masking key (RFC 6455 Section 5.3)
+    uint8_t mask[4];
+    for (int i = 0; i < 4; i++) {
+        mask[i] = (uint8_t)(rand() & 0xFF);
+    }
+    memcpy(frame + frame_len, mask, 4);
+    frame_len += 4;
 
     size_t total_size = frame_len + len;
 
@@ -576,17 +613,20 @@ int ws_send(websocket_context_t *ws, const uint8_t *data, size_t len) {
         // For simplicity, write in two parts if needed
         // Likely: at least have space for frame header
         if (__builtin_expect(available >= frame_len, 1)) {
-            // Write frame header
+            // Write frame header (includes masking key)
             memcpy(write_ptr, frame, frame_len);
             ringbuffer_commit_write(&ws->tx_buffer, frame_len);
 
-            // Write payload
+            // Write masked payload
             ringbuffer_get_write_ptr(&ws->tx_buffer, &write_ptr, &available);
             // Unlikely: should have space for payload after wraparound
             if (__builtin_expect(available < len, 0)) {
                 return -1;  // Not enough space for payload
             }
-            memcpy(write_ptr, data, len);
+            // Apply masking: masked_data[i] = data[i] XOR mask[i % 4]
+            for (size_t i = 0; i < len; i++) {
+                write_ptr[i] = data[i] ^ mask[i % 4];
+            }
             ringbuffer_commit_write(&ws->tx_buffer, len);
         } else {
             return -1;  // Not enough space
@@ -594,7 +634,10 @@ int ws_send(websocket_context_t *ws, const uint8_t *data, size_t len) {
     } else {
         // Likely: enough contiguous space - write both frame and data in one go
         memcpy(write_ptr, frame, frame_len);
-        memcpy(write_ptr + frame_len, data, len);
+        // Apply masking to payload: masked_data[i] = data[i] XOR mask[i % 4]
+        for (size_t i = 0; i < len; i++) {
+            write_ptr[frame_len + i] = data[i] ^ mask[i % 4];
+        }
         ringbuffer_commit_write(&ws->tx_buffer, total_size);
     }
 

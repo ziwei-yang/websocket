@@ -5,6 +5,7 @@
 
 #include "os.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -429,30 +430,47 @@ static mach_timebase_info_data_t g_timebase = {0, 0};
 static double g_ns_per_cycle = 0.0;
 #endif
 
+// Comparison function for qsort (used for median calculation)
+static int compare_double(const void *a, const void *b) {
+    double diff = *(const double*)a - *(const double*)b;
+    if (diff < 0) return -1;
+    if (diff > 0) return 1;
+    return 0;
+}
+
 // Initialize timer conversion - called lazily on first os_cycles_to_ns() call
 static void init_timer_conversion(void) {
 #if defined(__APPLE__) && defined(__aarch64__)
     mach_timebase_info(&g_timebase);
 #elif defined(__i386__) || defined(__x86_64__)
     // Calibrate TSC frequency against CLOCK_MONOTONIC
-    struct timespec start, end;
-    uint64_t tsc_start, tsc_end;
+    // Take 3 measurements and use median for robustness against interrupts
+    double samples[3];
 
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    tsc_start = rdtsc();
+    for (int sample = 0; sample < 3; sample++) {
+        struct timespec start, end;
+        uint64_t tsc_start, tsc_end;
 
-    // Sleep for 10ms to get accurate calibration
-    struct timespec sleep_time = {0, 10000000};
-    nanosleep(&sleep_time, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        tsc_start = rdtsc();
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    tsc_end = rdtsc();
+        // Sleep for 10ms to get accurate calibration
+        struct timespec sleep_time = {0, 10000000};
+        nanosleep(&sleep_time, NULL);
 
-    uint64_t ns_elapsed = (end.tv_sec - start.tv_sec) * 1000000000ULL +
-                         (end.tv_nsec - start.tv_nsec);
-    uint64_t cycles_elapsed = tsc_end - tsc_start;
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        tsc_end = rdtsc();
 
-    g_ns_per_cycle = (double)ns_elapsed / (double)cycles_elapsed;
+        uint64_t ns_elapsed = (end.tv_sec - start.tv_sec) * 1000000000ULL +
+                             (end.tv_nsec - start.tv_nsec);
+        uint64_t cycles_elapsed = tsc_end - tsc_start;
+
+        samples[sample] = (double)ns_elapsed / (double)cycles_elapsed;
+    }
+
+    // Use median to filter out outliers
+    qsort(samples, 3, sizeof(double), compare_double);
+    g_ns_per_cycle = samples[1];  // Middle value
 #endif
 }
 
@@ -486,6 +504,11 @@ double os_cycles_to_ns(uint64_t cycles) {
     // Generic fallback: integer division (still faster than FP)
     return (double)(cycles * g_timebase.numer / g_timebase.denom);
 #elif defined(__i386__) || defined(__x86_64__)
+    // Ensure initialization (only happens once, on first call if not already done)
+    if (__builtin_expect(g_ns_per_cycle == 0.0, 0)) {
+        init_timer_conversion();
+    }
+
     // x86/x64 - TSC cycles to nanoseconds
     // Use fixed-point for common frequencies (2.0-4.0 GHz range)
     // Pre-compute: g_ns_per_cycle_fp = (uint64_t)(g_ns_per_cycle * (1ULL << 32))

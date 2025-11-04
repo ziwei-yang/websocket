@@ -8,6 +8,8 @@ Exchange Server → TCP/IP Socket → SSL/TLS → Ringbuffer -> HTTP/Websocket P
 
 - **TCP/IP Socket**: Uses socket.h to handle network traffic
 - **SSL/TLS**: Uses OpenSSL/LibreSSL/OpenSSL+kTLS(Linux only) library for handshaking and message encryption/decryption support.
+  - **Linux default**: OpenSSL with Kernel TLS (kTLS) for optimal HFT performance (~5-10% lower CPU usage)
+  - **macOS default**: LibreSSL for best compatibility with Apple Silicon
 - **HTTP/Websocket**: Custom implementation (no external library) that parses HTTP 200 OK responses and extracts payload content
 	- Basic Websocket protocol features: automatically respond to **<89> PING frame**
 - **Event poll**: epoll on Linux, kqueue on macos
@@ -23,6 +25,29 @@ Exchange Server → TCP/IP Socket → SSL/TLS → Ringbuffer -> HTTP/Websocket P
 ### SSL/TLS Library Replaceable Design
 
 The `ssl.h` module provides an abstraction layer that wraps OpenSSL standard methods, enabling future TLS performance enhancements or alternative implementations.
+
+**Default Backends by Platform:**
+
+| Platform | Default Backend | Rationale | Override |
+|----------|----------------|-----------|----------|
+| **Linux** | OpenSSL + kTLS | Kernel TLS offload provides ~5-10% lower CPU usage and better latency consistency for HFT | `make SSL_BACKEND=openssl` |
+| **macOS** | LibreSSL | Best compatibility with Apple Silicon and Homebrew ecosystem | `make SSL_BACKEND=openssl` |
+
+**Available Backends:**
+- `ktls` - OpenSSL with Kernel TLS offload (Linux only, requires kernel 4.17+)
+- `openssl` - Standard OpenSSL without kernel offload
+- `libressl` - LibreSSL (OpenBSD's fork of OpenSSL)
+- `boringssl` - Google's fork of OpenSSL
+
+**kTLS Activation (Linux):**
+
+kTLS automatically activates when all conditions are met:
+1. Linux kernel module loaded (`lsmod | grep tls`)
+2. TLS 1.2 connection negotiated (TLS 1.3 kTLS requires kernel patches)
+3. AES-GCM cipher suite used
+4. Socket in blocking mode during handshake
+
+Verify kTLS: `make integration-test` → expect "TLS Mode: kTLS (Kernel) ✅"
 
 This project prioritizes extreme performance, and security features that introduce latency can be omitted. Any steps that increase latency should be skipped. The library is intentionally thread-unsafe, with no threads or locks introduced to maximize performance.
 

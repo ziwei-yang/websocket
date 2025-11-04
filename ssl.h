@@ -50,6 +50,10 @@ uint64_t ssl_get_hw_timestamp(ssl_context_t *ctx);
 // When kTLS is enabled, encryption/decryption is offloaded to the kernel for better performance
 int ssl_ktls_enabled(ssl_context_t *ctx);
 
+// Get TLS processing mode (kernel or userspace)
+// Returns "kTLS (Kernel)" if kernel offload is active, "OpenSSL (Userspace)" otherwise
+const char* ssl_get_tls_mode(ssl_context_t *ctx);
+
 // Get negotiated cipher suite name
 // Returns cipher name string (e.g., "ECDHE-RSA-AES128-GCM-SHA256"), or NULL if not connected
 const char* ssl_get_cipher_name(ssl_context_t *ctx);

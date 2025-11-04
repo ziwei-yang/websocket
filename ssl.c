@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
 // Linux hardware timestamping support
 #ifdef __linux__
@@ -69,6 +70,7 @@ struct ssl_context {
     int hw_timestamping_enabled;
     // kTLS enabled flag (Linux only, offloads crypto to kernel)
     int ktls_enabled;
+    int ktls_checked;  // Flag to track if kTLS has been checked
 };
 
 #define SSL_CONTEXT_MAGIC 0x53534C00  // "SSL\0" in little-endian
@@ -91,6 +93,7 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     sctx->magic = SSL_CONTEXT_MAGIC;  // Set magic value
     sctx->hw_timestamping_enabled = 0;  // Will be set if successful
     sctx->ktls_enabled = 0;  // Will be set if kTLS is enabled
+    sctx->ktls_checked = 0;  // Will be set to 1 after kTLS detection completes
 
     // Create socket
     struct hostent *server = gethostbyname(hostname);
@@ -107,9 +110,9 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
         return NULL;
     }
 
-    // Set non-blocking mode
-    int flags = fcntl(sctx->sockfd, F_GETFL, 0);
-    fcntl(sctx->sockfd, F_SETFL, flags | O_NONBLOCK);
+    // NOTE: Keep socket in blocking mode during TLS handshake for kTLS activation
+    // We'll switch to non-blocking mode after handshake completes successfully
+    // (OpenSSL's kTLS has issues activating on non-blocking sockets)
 
     // Optimize socket buffer sizes for low latency
     // Larger buffers reduce the chance of drops but may increase latency
@@ -195,41 +198,82 @@ void ssl_free(ssl_context_t *sctx) {
 
 int ssl_handshake(ssl_context_t *sctx) {
     if (!sctx) return -1;
-    
-    if (sctx->ssl) return 1;  // Already connected
-    
-    sctx->ssl = SSL_new(global_ctx);
-    if (!sctx->ssl) return -1;
 
-    SSL_set_fd(sctx->ssl, sctx->sockfd);
-
-    // Force AES-GCM cipher suites for hardware acceleration (configurable via WS_CIPHER_LIST)
-    const char *cipher_list = getenv("WS_CIPHER_LIST");
-    if (!cipher_list) {
-        // Default: Prioritize AES-GCM (hardware accelerated) over ChaCha20-Poly1305
-        cipher_list = "ECDHE-RSA-AES128-GCM-SHA256:"
-                      "ECDHE-RSA-AES256-GCM-SHA384:"
-                      "ECDHE-RSA-CHACHA20-POLY1305:"
-                      "AES128-GCM-SHA256:"
-                      "AES256-GCM-SHA384";
-    }
-    if (SSL_set_cipher_list(sctx->ssl, cipher_list) != 1) {
-        fprintf(stderr, "Warning: Failed to set cipher list: %s\n", cipher_list);
+    // If handshake already complete and kTLS already checked, return success
+    if (sctx->ssl && sctx->ktls_checked) {
+        return 1;  // Already connected and kTLS checked
     }
 
-#if defined(SSL_BACKEND_KTLS) && defined(KTLS_SUPPORTED)
-    // Enable kTLS before handshake (OpenSSL will set it up automatically if supported)
-    #ifdef SSL_OP_ENABLE_KTLS
-    SSL_set_options(sctx->ssl, SSL_OP_ENABLE_KTLS);
-    #endif
-#endif
-    
-    // Check if socket is connected
-    int optval;
-    socklen_t optlen = sizeof(optval);
-    if (getsockopt(sctx->sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen) == 0) {
-        if (optval != 0) return -1;  // Connection failed
-    }
+    // If SSL object doesn't exist yet, create it
+    if (!sctx->ssl) {
+        sctx->ssl = SSL_new(global_ctx);
+        if (!sctx->ssl) return -1;
+
+        SSL_set_fd(sctx->ssl, sctx->sockfd);
+
+        // Set SNI (Server Name Indication) - critical for CDN-backed endpoints
+        if (SSL_set_tlsext_host_name(sctx->ssl, sctx->hostname) != 1) {
+            fprintf(stderr, "Warning: failed to set SNI for %s\n", sctx->hostname);
+        }
+
+        #if defined(SSL_BACKEND_KTLS) && defined(KTLS_SUPPORTED)
+        // For kTLS: Allow both TLS 1.2 and 1.3 (let server choose)
+        // Set WS_FORCE_TLS13=1 to force TLS 1.3 only
+        // Set WS_ALLOW_TLS12=1 to force TLS 1.2 only (enables kTLS)
+        const char *force_tls13 = getenv("WS_FORCE_TLS13");
+        const char *allow_tls12 = getenv("WS_ALLOW_TLS12");
+        if (force_tls13 && atoi(force_tls13) == 1) {
+            // Force TLS 1.3 only (requires server support, kTLS limited)
+            SSL_set_min_proto_version(sctx->ssl, TLS1_3_VERSION);
+            SSL_set_max_proto_version(sctx->ssl, TLS1_3_VERSION);
+        } else if (allow_tls12 && atoi(allow_tls12) == 1) {
+            // Force TLS 1.2 for kTLS support (production-ready kTLS)
+            SSL_set_min_proto_version(sctx->ssl, TLS1_2_VERSION);
+            SSL_set_max_proto_version(sctx->ssl, TLS1_2_VERSION);
+        }
+        // Otherwise allow TLS 1.2 and 1.3 negotiation (default, prefers 1.3)
+
+        // Set TLS 1.3 cipher suites (kTLS-compatible: AES-GCM and ChaCha20-Poly1305)
+        const char *tls13_ciphersuites = getenv("WS_TLS13_CIPHERSUITES");
+        if (!tls13_ciphersuites) {
+            // Default: Prioritize AES-GCM (best kTLS support)
+            tls13_ciphersuites = "TLS_AES_128_GCM_SHA256:"
+                                 "TLS_AES_256_GCM_SHA384:"
+                                 "TLS_CHACHA20_POLY1305_SHA256";
+        }
+        if (SSL_set_ciphersuites(sctx->ssl, tls13_ciphersuites) != 1) {
+            fprintf(stderr, "Warning: Failed to set TLS 1.3 ciphersuites: %s\n", tls13_ciphersuites);
+        }
+        #endif
+
+        // Force AES-GCM cipher suites for TLS 1.2 (configurable via WS_CIPHER_LIST)
+        const char *cipher_list = getenv("WS_CIPHER_LIST");
+        if (!cipher_list) {
+            // Default: Prioritize AES-GCM (hardware accelerated) over ChaCha20-Poly1305
+            cipher_list = "ECDHE-RSA-AES128-GCM-SHA256:"
+                          "ECDHE-RSA-AES256-GCM-SHA384:"
+                          "ECDHE-RSA-CHACHA20-POLY1305:"
+                          "AES128-GCM-SHA256:"
+                          "AES256-GCM-SHA384";
+        }
+        if (SSL_set_cipher_list(sctx->ssl, cipher_list) != 1) {
+            fprintf(stderr, "Warning: Failed to set cipher list: %s\n", cipher_list);
+        }
+
+        #if defined(SSL_BACKEND_KTLS) && defined(KTLS_SUPPORTED)
+        // Enable kTLS before handshake (OpenSSL will set it up automatically if supported)
+        #ifdef SSL_OP_ENABLE_KTLS
+        SSL_set_options(sctx->ssl, SSL_OP_ENABLE_KTLS);
+        #endif
+        #endif
+
+        // Check if socket is connected (only check on first SSL creation)
+        int optval;
+        socklen_t optlen = sizeof(optval);
+        if (getsockopt(sctx->sockfd, SOL_SOCKET, SO_ERROR, &optval, &optlen) == 0) {
+            if (optval != 0) return -1;  // Connection failed
+        }
+    }  // End of if (!sctx->ssl) block
     
     int ret = SSL_connect(sctx->ssl);
     if (ret <= 0) {
@@ -247,8 +291,17 @@ int ssl_handshake(ssl_context_t *sctx) {
 
     #if OPENSSL_VERSION_NUMBER >= 0x30000000L
     // OpenSSL 3.0+ API
-    if (BIO_get_ktls_send(SSL_get_wbio(sctx->ssl)) &&
-        BIO_get_ktls_recv(SSL_get_rbio(sctx->ssl))) {
+    BIO *wbio = SSL_get_wbio(sctx->ssl);
+    BIO *rbio = SSL_get_rbio(sctx->ssl);
+    int send_ktls = BIO_get_ktls_send(wbio);
+    int recv_ktls = BIO_get_ktls_recv(rbio);
+
+    const char *debug_ktls = getenv("WS_DEBUG_KTLS");
+    if (debug_ktls && atoi(debug_ktls) == 1) {
+        fprintf(stderr, "[kTLS Debug] send_ktls=%d, recv_ktls=%d\n", send_ktls, recv_ktls);
+    }
+
+    if (send_ktls && recv_ktls) {
         sctx->ktls_enabled = 1;
     }
     #elif OPENSSL_VERSION_NUMBER >= 0x10101000L
@@ -262,7 +315,15 @@ int ssl_handshake(ssl_context_t *sctx) {
     #endif
 
     // If kTLS is not enabled, we continue with userspace OpenSSL (graceful fallback)
+    sctx->ktls_checked = 1;  // Mark that we've checked kTLS (prevents re-checking)
 #endif
+
+    // NOW switch to non-blocking mode after successful handshake
+    // (kTLS needs blocking mode during handshake to activate properly)
+    int flags = fcntl(sctx->sockfd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(sctx->sockfd, F_SETFL, flags | O_NONBLOCK);
+    }
 
     return 1;  // Handshake completed successfully
 }
@@ -391,6 +452,19 @@ const char *ssl_get_backend_name(void) {
 int ssl_ktls_enabled(ssl_context_t *sctx) {
     if (!sctx) return 0;
     return sctx->ktls_enabled;
+}
+
+// Get TLS processing mode (kernel or userspace)
+// Returns descriptive string indicating whether kTLS is active
+const char* ssl_get_tls_mode(ssl_context_t *sctx) {
+    if (!sctx) return "Unknown";
+
+#ifdef KTLS_SUPPORTED
+    if (sctx->ktls_enabled) {
+        return "kTLS (Kernel)";
+    }
+#endif
+    return "OpenSSL (Userspace)";
 }
 
 // Get negotiated cipher suite name
