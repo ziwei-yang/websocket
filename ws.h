@@ -46,13 +46,21 @@ void ws_close(websocket_context_t *ws);
 // Get connection state
 ws_state_t ws_get_state(websocket_context_t *ws);
 
-// Get timestamp when data was last received from socket (NIC arrival or start of recv)
-// Use this to measure socket-to-callback latency
-uint64_t ws_get_last_recv_timestamp(websocket_context_t *ws);
+// Get timestamp when event loop received data (start of recv, measured with TSC)
+// Use this to measure event-to-callback latency
+uint64_t ws_get_event_timestamp(websocket_context_t *ws);
 
 // Get timestamp when SSL_read completed (data decrypted and in userspace)
 // Use this to measure SSL decryption time separately from application processing
 uint64_t ws_get_ssl_read_timestamp(websocket_context_t *ws);
+
+// Get hardware NIC timestamp (Linux only, returns 0 if not available)
+// Timestamp in nanoseconds from hardware network card
+// Use this to measure true NIC-to-application latency
+uint64_t ws_get_hw_timestamp(websocket_context_t *ws);
+
+// Check if hardware timestamping is available (Linux only)
+int ws_has_hw_timestamping(websocket_context_t *ws);
 
 // Get socket file descriptor for select/poll/epoll
 // Returns -1 on error
@@ -69,13 +77,6 @@ int ws_wants_write(websocket_context_t *ws);
 // Flush TX buffer immediately without waiting for event loop
 // Returns 0 on success, -1 on error
 int ws_flush_tx(websocket_context_t *ws);
-
-// Get hardware NIC timestamp (Linux only, returns 0 if not available)
-// Timestamp in nanoseconds from hardware network card
-uint64_t ws_get_nic_timestamp(websocket_context_t *ws);
-
-// Check if hardware timestamping is available (Linux only)
-int ws_has_hw_timestamping(websocket_context_t *ws);
 
 // Get SSL cipher name (returns NULL if not connected)
 const char* ws_get_cipher_name(websocket_context_t *ws);

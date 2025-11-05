@@ -127,6 +127,7 @@ RINGBUFFER_SRC = ringbuffer.c
 SSL_SRC = ssl.c
 WS_SRC = ws.c
 WS_NOTIFIER_SRC = ws_notifier.c
+BIO_TIMESTAMP_SRC = bio_timestamp.c
 OS_SRC = os.c
 
 # Object files
@@ -134,13 +135,14 @@ RINGBUFFER_OBJ = $(OBJDIR)/ringbuffer.o
 SSL_OBJ = $(OBJDIR)/ssl.o
 WS_OBJ = $(OBJDIR)/ws.o
 WS_NOTIFIER_OBJ = $(OBJDIR)/ws_notifier.o
+BIO_TIMESTAMP_OBJ = $(OBJDIR)/bio_timestamp.o
 OS_OBJ = $(OBJDIR)/os.o
 
 # Libraries
 LIBRARY = libws.a
 
 # Common objects for library
-LIB_OBJS = $(RINGBUFFER_OBJ) $(SSL_OBJ) $(WS_OBJ) $(WS_NOTIFIER_OBJ) $(OS_OBJ)
+LIB_OBJS = $(RINGBUFFER_OBJ) $(SSL_OBJ) $(WS_OBJ) $(WS_NOTIFIER_OBJ) $(BIO_TIMESTAMP_OBJ) $(OS_OBJ)
 
 # Check for compiler
 ifeq ($(shell which $(CC) 2>/dev/null),)
@@ -166,6 +168,9 @@ $(WS_OBJ): $(WS_SRC) ws.h ssl.h ringbuffer.h os.h | $(OBJDIR)
 
 $(WS_NOTIFIER_OBJ): $(WS_NOTIFIER_SRC) ws_notifier.h | $(OBJDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $(WS_NOTIFIER_SRC) -o $@
+
+$(BIO_TIMESTAMP_OBJ): $(BIO_TIMESTAMP_SRC) bio_timestamp.h | $(OBJDIR)
+	$(CC) $(CFLAGS) $(INCLUDES) -c $(BIO_TIMESTAMP_SRC) -o $@
 
 $(OS_OBJ): $(OS_SRC) os.h | $(OBJDIR)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $(OS_SRC) -o $@

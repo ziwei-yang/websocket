@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __linux__
+#include "bio_timestamp.h"
+#endif
+
 typedef struct ssl_context ssl_context_t;
 
 // Initialize SSL context with hostname and port
@@ -45,6 +49,12 @@ int ssl_hw_timestamping_enabled(ssl_context_t *ctx);
 // Get latest hardware NIC timestamp if available (Linux only, returns 0 if not available)
 // Returns timestamp in nanoseconds
 uint64_t ssl_get_hw_timestamp(ssl_context_t *ctx);
+
+#ifdef __linux__
+// Get pointer to BIO timestamp storage (Linux only)
+// Returns pointer to bio_timestamp_t structure, or NULL if not available
+bio_timestamp_t* ssl_get_timestamp_storage(ssl_context_t *ctx);
+#endif
 
 // Check if Kernel TLS (kTLS) is enabled (Linux only, returns 0 on other platforms or if not enabled)
 // When kTLS is enabled, encryption/decryption is offloaded to the kernel for better performance

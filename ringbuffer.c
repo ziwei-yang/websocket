@@ -101,9 +101,11 @@ static int try_create_mirrored_buffer(ringbuffer_t *rb) {
     void *addr2 = mmap((uint8_t*)addr + RINGBUFFER_SIZE, RINGBUFFER_SIZE,
                        PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, fd, 0);
     if (addr2 == MAP_FAILED || addr2 != (uint8_t*)addr + RINGBUFFER_SIZE) {
-        // Properly clean up both mappings on failure
+        // Clean up first mapping
         munmap(addr1, RINGBUFFER_SIZE);
+        // Clean up the second half of the reserved region (still PROT_NONE)
         munmap((uint8_t*)addr + RINGBUFFER_SIZE, RINGBUFFER_SIZE);
+        // Don't munmap addr2 - it was never successfully mapped
         close(fd);
         return -1;
     }

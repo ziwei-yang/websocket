@@ -415,6 +415,10 @@ static inline uint64_t rdtsc(void) {
 static inline uint64_t rdtsc(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    // Check for overflow (year 2262+)
+    if ((uint64_t)ts.tv_sec > (UINT64_MAX / 1000000000ULL)) {
+        return UINT64_MAX;  // Saturate on overflow
+    }
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 #endif
@@ -494,15 +498,20 @@ double os_cycles_to_ns(uint64_t cycles) {
     // Common case: numer=125, denom=3 (M1/M2/M3/M4)
     // cycles * 125 / 3 = (cycles * 42667) >> 10 (error < 0.01%)
     if (g_timebase.numer == 125 && g_timebase.denom == 3) {
-        // Check for potential overflow
+        // Check for potential overflow in fast path
         if (cycles > (UINT64_MAX / 42667ULL)) {
-            // Fall back to division method for large values
-            return (double)(cycles * g_timebase.numer / g_timebase.denom);
+            // Use floating-point to avoid overflow (for processes running >49 hours)
+            return (double)cycles * (double)g_timebase.numer / (double)g_timebase.denom;
         }
         // Fast path: fixed-point multiplication (5-10x faster than FP)
         return (double)((cycles * 42667ULL) >> 10);
     }
-    // Generic fallback: integer division (still faster than FP)
+    // Generic fallback: check for overflow before multiplication
+    if (cycles > (UINT64_MAX / (uint64_t)g_timebase.numer)) {
+        // Use floating-point to avoid overflow (for processes running >49 hours)
+        return (double)cycles * (double)g_timebase.numer / (double)g_timebase.denom;
+    }
+    // Fast path: integer multiplication (faster than FP)
     return (double)(cycles * g_timebase.numer / g_timebase.denom);
 #elif defined(__i386__) || defined(__x86_64__)
     // Ensure initialization (only happens once, on first call if not already done)

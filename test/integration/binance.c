@@ -19,10 +19,10 @@
 
 // Timing record for each message - pre-allocated to avoid I/O during measurement
 typedef struct {
-    uint64_t recv_cycle;       // When data arrived from socket (NIC arrival or start of recv)
-    uint64_t ssl_read_cycle;   // When SSL_read completed (data decrypted)
-    uint64_t callback_cycle;   // When callback was invoked
-    uint64_t nic_timestamp_ns; // NIC hardware timestamp (if available)
+    uint64_t hw_timestamp_ns;  // NIC hardware timestamp in nanoseconds (if available)
+    uint64_t event_cycle;      // When event loop received data (TSC cycles)
+    uint64_t ssl_read_cycle;   // When SSL_read completed (TSC cycles)
+    uint64_t callback_cycle;   // When callback was invoked (TSC cycles)
     size_t payload_len;
     uint8_t opcode;
 } timing_record_t;
@@ -33,6 +33,11 @@ static int message_count = 0;
 static int runs_reported = 0;
 static timing_record_t timing_records[MAX_MESSAGES];
 static int hw_timestamping_available = 0;
+static uint64_t hw_timestamp_baseline_ns = 0;  // Baseline for hardware timestamps
+static uint64_t event_timestamp_baseline_ns = 0;  // Baseline for event timestamps
+
+// Forward declarations
+static double cycles_to_nanoseconds(uint64_t cycles);
 
 void on_message(websocket_context_t *ws, const uint8_t *payload_ptr, size_t payload_len, uint8_t opcode) {
     (void)payload_ptr;
@@ -46,22 +51,35 @@ void on_message(websocket_context_t *ws, const uint8_t *payload_ptr, size_t payl
     uint64_t callback_cycle = os_get_cpu_cycle();
 
     // Get timestamps for latency breakdown analysis
-    uint64_t recv_cycle = ws_get_last_recv_timestamp(ws);      // NIC arrival (or start of recv)
-    uint64_t ssl_read_cycle = ws_get_ssl_read_timestamp(ws);   // SSL_read completed
+    uint64_t event_cycle = ws_get_event_timestamp(ws);        // Event loop received data
+    uint64_t ssl_read_cycle = ws_get_ssl_read_timestamp(ws);  // SSL_read completed
 
     // Store timing data - NO I/O operations in hot path!
     timing_record_t *record = &timing_records[message_count];
     record->callback_cycle = callback_cycle;
-    record->recv_cycle = recv_cycle;
+    record->event_cycle = event_cycle;
     record->ssl_read_cycle = ssl_read_cycle;
     record->payload_len = payload_len;
     record->opcode = opcode;
 
-    // Capture NIC timestamp if hardware timestamping is available
+    // Capture hardware NIC timestamp if available
     if (hw_timestamping_available) {
-        record->nic_timestamp_ns = ws_get_nic_timestamp(ws);
+        uint64_t hw_ts = ws_get_hw_timestamp(ws);
+
+        // Initialize baseline on first message with valid HW timestamp
+        if (hw_timestamp_baseline_ns == 0 && hw_ts != 0) {
+            hw_timestamp_baseline_ns = hw_ts;
+            event_timestamp_baseline_ns = (uint64_t)cycles_to_nanoseconds(event_cycle);
+        }
+
+        // Store relative timestamp (relative to baseline)
+        if (hw_ts != 0 && hw_timestamp_baseline_ns != 0) {
+            record->hw_timestamp_ns = hw_ts - hw_timestamp_baseline_ns;
+        } else {
+            record->hw_timestamp_ns = 0;
+        }
     } else {
-        record->nic_timestamp_ns = 0;
+        record->hw_timestamp_ns = 0;
     }
 
     message_count++;
@@ -73,7 +91,6 @@ void on_message(websocket_context_t *ws, const uint8_t *payload_ptr, size_t payl
 }
 
 void on_status(websocket_context_t *ws, int status) {
-    (void)ws;
     if (status == 0) {
         printf("✅ WebSocket connected successfully!\n");
         connected = 1;
@@ -144,25 +161,46 @@ static void print_run_statistics(int run_index) {
     printf("Run %d/%d — warmup %d messages, analyzing next %d messages\n",
            run_index + 1, NUM_RUNS, WARMUP_MESSAGES, STATS_MESSAGES);
 
-    // Allocate buffers for three latency metrics
-    uint64_t *total_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t));  // NIC→APP
-    uint64_t *nic_ssl_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t)); // NIC→SSL
+    // Allocate buffers for latency metrics
+    uint64_t *total_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t));  // EVENT→APP (or HW→APP if HW timestamps available)
+    uint64_t *hw_event_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t)); // HW→EVENT (only if HW timestamps available)
+    uint64_t *event_ssl_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t)); // EVENT→SSL
     uint64_t *ssl_app_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t)); // SSL→APP
 
-    if (!total_latencies || !nic_ssl_latencies || !ssl_app_latencies) {
+    if (!total_latencies || !hw_event_latencies || !event_ssl_latencies || !ssl_app_latencies) {
         fprintf(stderr, "Failed to allocate latency buffers for run %d\n", run_index + 1);
         free(total_latencies);
-        free(nic_ssl_latencies);
+        free(hw_event_latencies);
+        free(event_ssl_latencies);
         free(ssl_app_latencies);
         return;
     }
 
-    // Calculate all three latency components
+    // Calculate latency components
     for (int i = 0; i < stats_count; i++) {
         int idx = stats_start + i;
-        total_latencies[i] = timing_records[idx].callback_cycle - timing_records[idx].recv_cycle;
-        nic_ssl_latencies[i] = timing_records[idx].ssl_read_cycle - timing_records[idx].recv_cycle;
+        total_latencies[i] = timing_records[idx].callback_cycle - timing_records[idx].event_cycle;
+        event_ssl_latencies[i] = timing_records[idx].ssl_read_cycle - timing_records[idx].event_cycle;
         ssl_app_latencies[i] = timing_records[idx].callback_cycle - timing_records[idx].ssl_read_cycle;
+
+        // HW→EVENT latency (only valid if HW timestamp available)
+        // Note: Both timestamps are now relative to their baselines
+        if (hw_timestamping_available && timing_records[idx].hw_timestamp_ns != 0 && event_timestamp_baseline_ns != 0) {
+            // Convert EVENT timestamp from TSC cycles to nanoseconds (relative to baseline)
+            double event_ns_absolute = cycles_to_nanoseconds(timing_records[idx].event_cycle);
+            double event_ns_relative = event_ns_absolute - event_timestamp_baseline_ns;
+
+            // HW timestamp is already relative to baseline
+            double hw_ns_relative = (double)timing_records[idx].hw_timestamp_ns;
+
+            // Calculate HW→EVENT latency (both are now relative, so subtraction works)
+            double hw_event_ns = event_ns_relative - hw_ns_relative;
+
+            // Store as nanoseconds (not cycles) for display
+            hw_event_latencies[i] = (hw_event_ns >= 0) ? (uint64_t)hw_event_ns : 0;
+        } else {
+            hw_event_latencies[i] = 0;
+        }
     }
 
     // Keep backward compatibility - use total latency for existing logic
@@ -234,7 +272,7 @@ static void print_run_statistics(int run_index) {
         printf("\nSample measurements (first %d after warmup):\n", sample_count);
         for (int i = 0; i < sample_count; i++) {
             int global_idx = stats_start + i;
-            uint64_t latency = timing_records[global_idx].callback_cycle - timing_records[global_idx].recv_cycle;
+            uint64_t latency = timing_records[global_idx].callback_cycle - timing_records[global_idx].event_cycle;
             printf("  [%d] %" PRIu64 " ticks (%.2f ns), %zu bytes, opcode=%d\n",
                    global_idx + 1, latency, cycles_to_nanoseconds(latency),
                    timing_records[global_idx].payload_len, timing_records[global_idx].opcode);
@@ -243,7 +281,7 @@ static void print_run_statistics(int run_index) {
             printf("Sample measurements (last %d of run):\n", sample_count);
             for (int i = stats_count - sample_count; i < stats_count; i++) {
                 int global_idx = stats_start + i;
-                uint64_t latency = timing_records[global_idx].callback_cycle - timing_records[global_idx].recv_cycle;
+                uint64_t latency = timing_records[global_idx].callback_cycle - timing_records[global_idx].event_cycle;
                 printf("  [%d] %" PRIu64 " ticks (%.2f ns), %zu bytes, opcode=%d\n",
                        global_idx + 1, latency, cycles_to_nanoseconds(latency),
                        timing_records[global_idx].payload_len, timing_records[global_idx].opcode);
@@ -251,32 +289,72 @@ static void print_run_statistics(int run_index) {
         }
     }
 
-    // Display latency breakdown (NIC→SSL vs SSL→APP)
+    // Display latency breakdown
     printf("\n📊 Latency Breakdown (Mean):\n");
-    double mean_nic_ssl = 0.0, mean_ssl_app = 0.0;
-    for (int i = 0; i < stats_count; i++) {
-        mean_nic_ssl += (double)nic_ssl_latencies[i];
-        mean_ssl_app += (double)ssl_app_latencies[i];
-    }
-    mean_nic_ssl /= stats_count;
-    mean_ssl_app /= stats_count;
 
-    printf("   NIC→SSL (decryption):  %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
-           mean_nic_ssl, cycles_to_nanoseconds((uint64_t)mean_nic_ssl),
-           100.0 * mean_nic_ssl / avg_latency);
-    printf("   SSL→APP (processing):  %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
-           mean_ssl_app, cycles_to_nanoseconds((uint64_t)mean_ssl_app),
-           100.0 * mean_ssl_app / avg_latency);
-    printf("   ────────────────────────────────────────────────\n");
-    printf("   Total (NIC→APP):       %10.0f ticks (%10.2f ns)  [100.0%%]\n",
-           avg_latency, cycles_to_nanoseconds((uint64_t)avg_latency));
+    if (hw_timestamping_available) {
+        // Calculate means for all three stages
+        double mean_hw_event = 0.0, mean_event_ssl = 0.0, mean_ssl_app = 0.0;
+        int valid_hw_count = 0;
+
+        for (int i = 0; i < stats_count; i++) {
+            if (hw_event_latencies[i] > 0) {
+                mean_hw_event += (double)hw_event_latencies[i];
+                valid_hw_count++;
+            }
+            mean_event_ssl += (double)event_ssl_latencies[i];
+            mean_ssl_app += (double)ssl_app_latencies[i];
+        }
+
+        if (valid_hw_count > 0) {
+            mean_hw_event /= valid_hw_count;
+            mean_event_ssl /= stats_count;
+            mean_ssl_app /= stats_count;
+
+            // Note: mean_hw_event is already in nanoseconds
+            printf("   HW→EVENT (kernel):         %10.0f ns  [%.1f%%]\n",
+                   mean_hw_event,
+                   100.0 * mean_hw_event / (mean_hw_event + cycles_to_nanoseconds((uint64_t)mean_event_ssl) + cycles_to_nanoseconds((uint64_t)mean_ssl_app)));
+            printf("   EVENT→SSL (decryption):    %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
+                   mean_event_ssl, cycles_to_nanoseconds((uint64_t)mean_event_ssl),
+                   100.0 * cycles_to_nanoseconds((uint64_t)mean_event_ssl) / (mean_hw_event + cycles_to_nanoseconds((uint64_t)mean_event_ssl) + cycles_to_nanoseconds((uint64_t)mean_ssl_app)));
+            printf("   SSL→APP (processing):      %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
+                   mean_ssl_app, cycles_to_nanoseconds((uint64_t)mean_ssl_app),
+                   100.0 * cycles_to_nanoseconds((uint64_t)mean_ssl_app) / (mean_hw_event + cycles_to_nanoseconds((uint64_t)mean_event_ssl) + cycles_to_nanoseconds((uint64_t)mean_ssl_app)));
+            printf("   ────────────────────────────────────────────────\n");
+            printf("   Total (HW→APP):            %10.2f ns  [100.0%%]\n",
+                   mean_hw_event + cycles_to_nanoseconds((uint64_t)mean_event_ssl) + cycles_to_nanoseconds((uint64_t)mean_ssl_app));
+        } else {
+            printf("   ⚠️  No valid hardware timestamps captured\n");
+        }
+    } else {
+        // Without hardware timestamps, show EVENT→SSL and SSL→APP only
+        double mean_event_ssl = 0.0, mean_ssl_app = 0.0;
+        for (int i = 0; i < stats_count; i++) {
+            mean_event_ssl += (double)event_ssl_latencies[i];
+            mean_ssl_app += (double)ssl_app_latencies[i];
+        }
+        mean_event_ssl /= stats_count;
+        mean_ssl_app /= stats_count;
+
+        printf("   EVENT→SSL (decryption):    %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
+               mean_event_ssl, cycles_to_nanoseconds((uint64_t)mean_event_ssl),
+               100.0 * mean_event_ssl / avg_latency);
+        printf("   SSL→APP (processing):      %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
+               mean_ssl_app, cycles_to_nanoseconds((uint64_t)mean_ssl_app),
+               100.0 * mean_ssl_app / avg_latency);
+        printf("   ────────────────────────────────────────────────\n");
+        printf("   Total (EVENT→APP):         %10.0f ticks (%10.2f ns)  [100.0%%]\n",
+               avg_latency, cycles_to_nanoseconds((uint64_t)avg_latency));
+    }
 
     // Flush output immediately for real-time visibility
     fflush(stdout);
 
     free(sorted);
     free(total_latencies);
-    free(nic_ssl_latencies);
+    free(hw_event_latencies);
+    free(event_ssl_latencies);
     free(ssl_app_latencies);
 }
 
@@ -311,7 +389,7 @@ static void print_overall_statistics(void) {
             if (idx >= message_count) {
                 break;
             }
-            latencies[count++] = timing_records[idx].callback_cycle - timing_records[idx].recv_cycle;
+            latencies[count++] = timing_records[idx].callback_cycle - timing_records[idx].event_cycle;
         }
     }
 
@@ -513,13 +591,19 @@ int main(int argc, char *argv[]) {
 
     // Check for hardware timestamping support
     hw_timestamping_available = ws_has_hw_timestamping(ws);
+    printf("\n📡 NIC Hardware Timestamping:\n");
     if (hw_timestamping_available) {
-        printf("📡 Hardware timestamping: ENABLED (NIC-level timestamps available)\n");
+        printf("   Status: ✅ ENABLED - NIC supports hardware packet timestamping\n");
+        printf("   Latency Tracking: HW→EVENT, EVENT→SSL, SSL→APP breakdown available\n");
     } else {
 #ifdef __linux__
-        printf("📡 Hardware timestamping: Not available (requires NIC support)\n");
+        printf("   Status: ❌ DISABLED (default - kTLS mode active)\n");
+        printf("   Reason: Hardware timestamps disabled to allow kTLS kernel offload\n");
+        printf("   Enable: Set WS_ENABLE_HW_TIMESTAMPS=1 to enable (disables kTLS)\n");
+        printf("   Latency Tracking: EVENT→SSL, SSL→APP breakdown only\n");
 #else
-        printf("📡 Hardware timestamping: Not available (Linux-only feature)\n");
+        printf("   Status: ❌ NOT AVAILABLE (Linux-only feature)\n");
+        printf("   Latency Tracking: EVENT→SSL, SSL→APP breakdown only\n");
 #endif
     }
 
@@ -529,7 +613,7 @@ int main(int argc, char *argv[]) {
     int tx_mirrored = ws_get_tx_buffer_is_mirrored(ws);
     int tx_mmap = ws_get_tx_buffer_is_mmap(ws);
 
-    printf("🔄 Ringbuffer Configuration:\n");
+    printf("\n🔄 Ringbuffer Configuration:\n");
     printf("   RX Buffer: %s | %s\n",
            rx_mirrored ? "MIRRORED ✅" : "Standard",
            rx_mmap ? "mmap" : "malloc");
@@ -583,10 +667,20 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Print SSL configuration after successful connection
-        printf("\n🔐 SSL Configuration:\n");
+        // Print SSL/TLS configuration after successful connection
+        printf("\n🔐 SSL/TLS Configuration:\n");
+
+        // TLS Mode (kTLS or userspace)
+        const char *tls_mode = ws_get_tls_mode(ws);
+        printf("   TLS Mode:              ");
+        if (tls_mode && strstr(tls_mode, "kTLS")) {
+            printf("%s ✅ [KERNEL OFFLOAD]\n", tls_mode);
+        } else {
+            printf("%s ⚠️  [USERSPACE]\n", tls_mode ? tls_mode : "Unknown");
+        }
+
         const char *backend_version = ssl_get_backend_version();
-        printf("   Backend:               %s\n", backend_version ? backend_version : "Unknown");
+        printf("   SSL Backend:           %s\n", backend_version ? backend_version : "Unknown");
 
         const char *cipher_name = ws_get_cipher_name(ws);
         printf("   Cipher Suite:          %s\n", cipher_name ? cipher_name : "Unknown");
@@ -599,14 +693,6 @@ int main(int argc, char *argv[]) {
 #elif defined(__aarch64__) || defined(__arm64__)
             printf(" (ARM Crypto Extensions)");
 #endif
-        }
-        printf("\n");
-
-        const char *tls_mode = ws_get_tls_mode(ws);
-        if (tls_mode && strstr(tls_mode, "kTLS")) {
-            printf("   TLS Mode:              %s ✅ [KERNEL OFFLOAD]\n", tls_mode);
-        } else {
-            printf("   TLS Mode:              %s ℹ️  [userspace]\n", tls_mode ? tls_mode : "Unknown");
         }
         printf("\n");
     }

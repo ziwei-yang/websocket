@@ -14,6 +14,10 @@
 #include <stdlib.h>
 #include <errno.h>
 
+#ifdef __linux__
+#include "bio_timestamp.h"
+#endif
+
 // Linux hardware timestamping support
 #ifdef __linux__
 #include <linux/net_tstamp.h>
@@ -30,6 +34,17 @@
 // Static global context for thread-unsafe but fast operations
 static SSL_CTX *global_ctx = NULL;
 static int ssl_initialized = 0;
+
+// Helper: Safe environment variable parsing (returns 1 if valid "1", 0 otherwise)
+static inline int env_is_enabled(const char *value) {
+    if (!value) return 0;
+    char *endptr;
+    errno = 0;  // Clear errno before strtol
+    long val = strtol(value, &endptr, 10);
+    // Reject on overflow, parse error, or value != 1
+    if (errno == ERANGE || *endptr != '\0') return 0;
+    return (val == 1);
+}
 
 // Initialize OpenSSL library only once (called on first connection)
 static void ssl_init_once(void) {
@@ -72,6 +87,10 @@ struct ssl_context {
     // kTLS enabled flag (Linux only, offloads crypto to kernel)
     int ktls_enabled;
     int ktls_checked;  // Flag to track if kTLS has been checked
+#ifdef __linux__
+    // Hardware timestamp storage (shared with custom BIO)
+    bio_timestamp_t bio_ts_storage;
+#endif
 };
 
 #define SSL_CONTEXT_MAGIC 0x53534C00  // "SSL\0" in little-endian
@@ -91,7 +110,9 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
+    // Port string buffer: "65535\0" = 6 bytes (max port) + safety margin
     char port_str[8];
+    _Static_assert(sizeof(port_str) > 6, "port_str buffer must fit max port (65535) + null");
     snprintf(port_str, sizeof(port_str), "%d", port);
 
     if (getaddrinfo(hostname, port_str, &hints, &result) != 0) {
@@ -120,6 +141,10 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     sctx->hw_timestamping_enabled = 0;  // Will be set if successful
     sctx->ktls_enabled = 0;  // Will be set if kTLS is enabled
     sctx->ktls_checked = 0;  // Will be set to 1 after kTLS detection completes
+#ifdef __linux__
+    sctx->bio_ts_storage.hw_timestamp_ns = 0;
+    sctx->bio_ts_storage.hw_available = 0;
+#endif
 
     // Create socket
     sctx->sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -177,18 +202,31 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
 #endif
 
 #ifdef HW_TIMESTAMPING_SUPPORTED
-    // Enable hardware timestamping on Linux
-    // Request: hardware RX timestamps, software fallback, raw hardware timestamps
-    int timestamping_flags = SOF_TIMESTAMPING_RX_HARDWARE |
-                             SOF_TIMESTAMPING_RX_SOFTWARE |
-                             SOF_TIMESTAMPING_SOFTWARE |
-                             SOF_TIMESTAMPING_RAW_HARDWARE;
+    // Hardware timestamping support (Linux only)
+    // IMPORTANT: Hardware timestamping and kTLS are mutually exclusive!
+    // - With kTLS (default): Best CPU performance, no HW timestamps (EVENT→SSL→APP only)
+    // - With HW timestamps: Full latency visibility (HW→EVENT→SSL→APP), higher CPU usage
+    // Set WS_ENABLE_HW_TIMESTAMPS=1 to prioritize hardware timestamps over kTLS
+    const char *enable_hw_ts = getenv("WS_ENABLE_HW_TIMESTAMPS");
+    if (env_is_enabled(enable_hw_ts)) {
+        // User explicitly requested hardware timestamping
+        // This will disable kTLS (custom BIO required for recvmsg)
+        int timestamping_flags = SOF_TIMESTAMPING_RX_HARDWARE |
+                                 SOF_TIMESTAMPING_RX_SOFTWARE |
+                                 SOF_TIMESTAMPING_SOFTWARE |
+                                 SOF_TIMESTAMPING_RAW_HARDWARE;
 
-    if (setsockopt(sctx->sockfd, SOL_SOCKET, SO_TIMESTAMPING,
-                   &timestamping_flags, sizeof(timestamping_flags)) == 0) {
-        sctx->hw_timestamping_enabled = 1;
+        if (setsockopt(sctx->sockfd, SOL_SOCKET, SO_TIMESTAMPING,
+                       &timestamping_flags, sizeof(timestamping_flags)) == 0) {
+            sctx->hw_timestamping_enabled = 1;
+
+            const char *debug = getenv("WS_DEBUG_KTLS");
+            if (env_is_enabled(debug)) {
+                fprintf(stderr, "[HW Timestamps] Enabled - kTLS will be disabled\n");
+            }
+        }
     }
-    // If setsockopt fails, we continue without timestamping (graceful degradation)
+    // If not explicitly enabled, hw_timestamping_enabled remains 0 and kTLS can activate
 #endif
 
     // Use non-blocking connect with timeout to avoid stalling application
@@ -210,6 +248,21 @@ ssl_context_t *ssl_init(const char *hostname, int port) {
     if (connect_result < 0) {
         if (errno == EINPROGRESS) {
             // Connection in progress - wait with timeout (5 seconds for HFT)
+
+            // CRITICAL: Check FD_SETSIZE before using select()
+            // FD_SET() has no bounds checking and will cause buffer overflow if sockfd >= FD_SETSIZE
+            // Common in production servers with many open files (logs, DB connections, etc.)
+            if (sctx->sockfd >= FD_SETSIZE) {
+                // File descriptor too high for select() - fail with diagnostic
+                fprintf(stderr, "ERROR: Socket FD %d >= FD_SETSIZE %d. Close unused files or use poll() instead of select().\n",
+                        sctx->sockfd, FD_SETSIZE);
+                close(sctx->sockfd);
+                free(sctx->hostname);
+                free(sctx);
+                freeaddrinfo(result);
+                return NULL;
+            }
+
             fd_set write_fds;
             struct timeval timeout;
             timeout.tv_sec = 5;
@@ -303,7 +356,22 @@ int ssl_handshake(ssl_context_t *sctx) {
         sctx->ssl = SSL_new(global_ctx);
         if (!sctx->ssl) return -1;
 
+#ifdef __linux__
+        // Use custom BIO for hardware timestamping on Linux
+        if (sctx->hw_timestamping_enabled) {
+            BIO *bio = BIO_new_timestamp_socket(sctx->sockfd, &sctx->bio_ts_storage);
+            if (bio != NULL) {
+                SSL_set_bio(sctx->ssl, bio, bio);  // Set both read and write BIO
+            } else {
+                // Fallback to standard BIO if custom BIO fails
+                SSL_set_fd(sctx->ssl, sctx->sockfd);
+            }
+        } else {
+            SSL_set_fd(sctx->ssl, sctx->sockfd);
+        }
+#else
         SSL_set_fd(sctx->ssl, sctx->sockfd);
+#endif
 
         // Set SNI (Server Name Indication) - critical for CDN-backed endpoints
         if (SSL_set_tlsext_host_name(sctx->ssl, sctx->hostname) != 1) {
@@ -314,7 +382,7 @@ int ssl_handshake(ssl_context_t *sctx) {
         // For kTLS: Default to TLS 1.2 (production-ready kTLS)
         // Set WS_FORCE_TLS13=1 to override and use TLS 1.3 (disables kTLS)
         const char *force_tls13 = getenv("WS_FORCE_TLS13");
-        if (force_tls13 && atoi(force_tls13) == 1) {
+        if (env_is_enabled(force_tls13)) {
             // Override: Force TLS 1.3 only (disables kTLS, uses userspace OpenSSL)
             SSL_set_min_proto_version(sctx->ssl, TLS1_3_VERSION);
             SSL_set_max_proto_version(sctx->ssl, TLS1_3_VERSION);
@@ -388,12 +456,19 @@ int ssl_handshake(ssl_context_t *sctx) {
     int recv_ktls = BIO_get_ktls_recv(rbio);
 
     const char *debug_ktls = getenv("WS_DEBUG_KTLS");
-    if (debug_ktls && atoi(debug_ktls) == 1) {
+    if (env_is_enabled(debug_ktls)) {
         fprintf(stderr, "[kTLS Debug] send_ktls=%d, recv_ktls=%d\n", send_ktls, recv_ktls);
     }
 
     if (send_ktls && recv_ktls) {
         sctx->ktls_enabled = 1;
+        if (env_is_enabled(debug_ktls)) {
+            fprintf(stderr, "[kTLS Debug] kTLS successfully enabled!\n");
+        }
+    } else {
+        if (env_is_enabled(debug_ktls)) {
+            fprintf(stderr, "[kTLS Debug] kTLS not enabled (send=%d, recv=%d)\n", send_ktls, recv_ktls);
+        }
     }
     #elif OPENSSL_VERSION_NUMBER >= 0x10101000L
     // OpenSSL 1.1.1+ API (BIO_get_ktls_send/recv may not be available)
@@ -478,6 +553,8 @@ int ssl_get_error_code(ssl_context_t *sctx, int ret) {
 
 int ssl_read_into(ssl_context_t *sctx, uint8_t *buf, size_t len) {
     if (!sctx || !sctx->ssl) return -1;
+    // Clamp to INT_MAX for safe cast (SSL_read takes int)
+    if (len > INT_MAX) len = INT_MAX;
     return SSL_read(sctx->ssl, buf, len);
 }
 
@@ -491,63 +568,26 @@ int ssl_hw_timestamping_enabled(ssl_context_t *sctx) {
     return sctx->hw_timestamping_enabled;
 }
 
-#ifdef HW_TIMESTAMPING_SUPPORTED
-// Try to extract hardware timestamp from socket error queue (Linux only)
-// Returns timestamp in nanoseconds, or 0 if not available
-static uint64_t try_get_hw_timestamp(int sockfd) {
-    char control[512];
-    struct msghdr msg;
-    struct iovec iov;
-    char data[1];
-
-    // Setup message structure for recvmsg
-    memset(&msg, 0, sizeof(msg));
-    iov.iov_base = data;
-    iov.iov_len = sizeof(data);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control;
-    msg.msg_controllen = sizeof(control);
-
-    // Try to read from error queue (non-blocking)
-    if (recvmsg(sockfd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT) < 0) {
-        return 0;  // No timestamp available
-    }
-
-    // Parse control messages for timestamps
-    struct cmsghdr *cmsg;
-    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPING) {
-            struct timespec *ts = (struct timespec *)CMSG_DATA(cmsg);
-            // ts[0] = software timestamp
-            // ts[1] = (deprecated)
-            // ts[2] = hardware timestamp (if available)
-
-            // Try hardware timestamp first (ts[2])
-            if (ts[2].tv_sec != 0 || ts[2].tv_nsec != 0) {
-                return (uint64_t)ts[2].tv_sec * 1000000000ULL + ts[2].tv_nsec;
-            }
-            // Fall back to software timestamp (ts[0])
-            if (ts[0].tv_sec != 0 || ts[0].tv_nsec != 0) {
-                return (uint64_t)ts[0].tv_sec * 1000000000ULL + ts[0].tv_nsec;
-            }
-        }
-    }
-
-    return 0;
-}
-#endif
-
 // Get latest hardware timestamp if available (Linux only)
+// Note: Hardware timestamps are now captured via custom BIO in bio_timestamp.c
 uint64_t ssl_get_hw_timestamp(ssl_context_t *sctx) {
     if (!sctx || !sctx->hw_timestamping_enabled) return 0;
 
 #ifdef HW_TIMESTAMPING_SUPPORTED
-    return try_get_hw_timestamp(sctx->sockfd);
+    // Return timestamp from BIO storage (updated during SSL_read via custom BIO)
+    return sctx->bio_ts_storage.hw_timestamp_ns;
 #else
     return 0;
 #endif
 }
+
+#ifdef __linux__
+// Get pointer to BIO timestamp storage (Linux only)
+bio_timestamp_t* ssl_get_timestamp_storage(ssl_context_t *sctx) {
+    if (!sctx) return NULL;
+    return &sctx->bio_ts_storage;
+}
+#endif
 
 // Get backend name at runtime
 const char *ssl_get_backend_name(void) {

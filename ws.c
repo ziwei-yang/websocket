@@ -21,6 +21,17 @@
 // #define WS_DEBUG 1
 #define WS_HTTP_BUFFER_SIZE 4096
 
+// Helper: Safe environment variable parsing (returns 1 if valid "1", 0 otherwise)
+static inline int env_is_enabled(const char *value) {
+    if (!value) return 0;
+    char *endptr;
+    errno = 0;  // Clear errno before strtol
+    long val = strtol(value, &endptr, 10);
+    // Reject on overflow, parse error, or value != 1
+    if (errno == ERANGE || *endptr != '\0') return 0;
+    return (val == 1);
+}
+
 typedef enum {
     WS_FRAME_CONTINUATION = 0x0,
     WS_FRAME_TEXT = 0x1,
@@ -75,18 +86,17 @@ struct websocket_context {
     size_t http_len;
     int handshake_sent;
 
-    // Latency measurement - timestamp when data last received from socket (NIC arrival)
-    uint64_t last_recv_timestamp;
+    // Latency measurement timestamps
+    uint64_t event_timestamp;              // When event loop received data (TSC cycles)
+    uint64_t ssl_read_complete_timestamp;  // When SSL_read completed (TSC cycles)
 
-    // Timestamp when SSL_read completed (data decrypted and in userspace)
-    uint64_t ssl_read_complete_timestamp;
+#ifdef __linux__
+    uint64_t hw_timestamp_ns;              // Hardware NIC timestamp in nanoseconds (0 if unavailable)
+    int hw_timestamping_available;
+#endif
 
     // Optimization #8: Flag to avoid checking tx_buffer when empty (receive-only workload)
     uint8_t has_pending_tx;
-
-    // Hardware NIC timestamp (Linux only, in nanoseconds)
-    uint64_t last_nic_timestamp;
-    int hw_timestamping_available;
 };
 
 // Generate masking key using PRNG (seeds on first call)
@@ -142,9 +152,9 @@ static inline uint32_t get_masking_key(websocket_context_t *ws) {
     return ws_prng_next(&ws->prng);
 }
 
-uint64_t ws_get_last_recv_timestamp(websocket_context_t *ws) {
+uint64_t ws_get_event_timestamp(websocket_context_t *ws) {
     if (!ws) return 0;
-    return ws->last_recv_timestamp;
+    return ws->event_timestamp;
 }
 
 uint64_t ws_get_ssl_read_timestamp(websocket_context_t *ws) {
@@ -152,19 +162,27 @@ uint64_t ws_get_ssl_read_timestamp(websocket_context_t *ws) {
     return ws->ssl_read_complete_timestamp;
 }
 
-int ws_get_fd(websocket_context_t *ws) {
-    if (!ws || !ws->ssl) return -1;
-    return ssl_get_fd(ws->ssl);
-}
-
-uint64_t ws_get_nic_timestamp(websocket_context_t *ws) {
+uint64_t ws_get_hw_timestamp(websocket_context_t *ws) {
     if (!ws) return 0;
-    return ws->last_nic_timestamp;
+#ifdef __linux__
+    return ws->hw_timestamp_ns;
+#else
+    return 0;
+#endif
 }
 
 int ws_has_hw_timestamping(websocket_context_t *ws) {
     if (!ws) return 0;
+#ifdef __linux__
     return ws->hw_timestamping_available;
+#else
+    return 0;
+#endif
+}
+
+int ws_get_fd(websocket_context_t *ws) {
+    if (!ws || !ws->ssl) return -1;
+    return ssl_get_fd(ws->ssl);
 }
 
 const char* ws_get_cipher_name(websocket_context_t *ws) {
@@ -278,7 +296,7 @@ static int parse_url(const char *url, char **hostname, int *port, char **path) {
         if (!*hostname) {
             return -1;
         }
-        strncpy(*hostname, url, hostname_len);
+        memcpy(*hostname, url, hostname_len);
         (*hostname)[hostname_len] = '\0';
 
         // Validate port using strtol (safer than atoi)
@@ -308,7 +326,7 @@ static int parse_url(const char *url, char **hostname, int *port, char **path) {
         if (!*hostname) {
             return -1;
         }
-        strncpy(*hostname, url, hostname_len);
+        memcpy(*hostname, url, hostname_len);
         (*hostname)[hostname_len] = '\0';
 
         *port = default_port;  // Use scheme-specific default
@@ -380,22 +398,33 @@ websocket_context_t *ws_init(const char *url) {
 
     ws->connected = 0;
     ws->handshake_sent = 0;
+
+#ifdef __linux__
     ws->hw_timestamping_available = ssl_hw_timestamping_enabled(ws->ssl);
-    ws->last_nic_timestamp = 0;
+    ws->hw_timestamp_ns = 0;
+#endif
 
     return ws;
 }
 
 void ws_free(websocket_context_t *ws) {
     if (!ws) return;
-    
+
+    // Defense-in-depth: Zero sensitive data before free
+    // PRNG state contains entropy that could be used to predict masking keys
+    // Use volatile to prevent compiler optimization from removing the memset
+    volatile uint8_t *prng_ptr = (volatile uint8_t *)&ws->prng;
+    for (size_t i = 0; i < sizeof(ws->prng); i++) {
+        prng_ptr[i] = 0;
+    }
+
     ssl_free(ws->ssl);
     ringbuffer_free(&ws->rx_buffer);
     ringbuffer_free(&ws->tx_buffer);
-    
+
     if (ws->hostname) free(ws->hostname);
     if (ws->path) free(ws->path);
-    
+
     free(ws);
 }
 
@@ -416,6 +445,14 @@ static int send_handshake(websocket_context_t *ws) {
                    "key buffer too small for base64-encoded 16-byte random");
     generate_ws_key(key);
 
+    // Build Host header with port if non-standard (RFC 6455 requires port for non-443)
+    char host_header[256];
+    if (ws->port != 443) {
+        snprintf(host_header, sizeof(host_header), "%s:%d", ws->hostname, ws->port);
+    } else {
+        snprintf(host_header, sizeof(host_header), "%s", ws->hostname);
+    }
+
     char handshake[1024];
     // Check snprintf return value for truncation
     int len = snprintf(handshake, sizeof(handshake),
@@ -426,7 +463,7 @@ static int send_handshake(websocket_context_t *ws) {
         "Sec-WebSocket-Key: %s\r\n"
         "Sec-WebSocket-Version: 13\r\n"
         "\r\n",
-        ws->path, ws->hostname, key);
+        ws->path, host_header, key);
 
     if (len < 0 || len >= (int)sizeof(handshake)) {
         // Handshake too large or encoding error
@@ -468,22 +505,31 @@ static int parse_http_response(websocket_context_t *ws) {
 // Assumes: well-formed frames, FIN=1, no masking, complete frames in buffer
 // Optimization #7: Accept cached available to avoid redundant ringbuffer_available_read()
 static int parse_ws_frame_zero_copy(websocket_context_t *ws, size_t available, uint8_t **payload_ptr, size_t *payload_len, uint8_t *opcode) {
-    if (available < 2) return 0;
+    if (__builtin_expect(available < 2, 0)) return 0;  // Expect enough data available
 
     // Get direct pointer to ringbuffer data (zero-copy)
     uint8_t *data_ptr = NULL;
     size_t data_len = 0;
     ringbuffer_peek_read(&ws->rx_buffer, &data_ptr, &data_len);
-    if (data_len < 2) return 0;
+    if (__builtin_expect(data_len < 2, 0)) return 0;  // Expect valid peek
 
     // Parse frame header - assume FIN=1, well-formed
     *opcode = data_ptr[0] & 0x0F;
+
+    // RFC 6455 Section 5.1: Server MUST NOT mask frames sent to client
+    // Bit 7 of byte 1 is the MASK bit - must be 0 for server-to-client frames
+    uint8_t mask_bit = data_ptr[1] & 0x80;
+    if (__builtin_expect(mask_bit != 0, 0)) {
+        return -1;  // Protocol violation: server frames must not be masked
+    }
+
     uint64_t payload_len_raw = data_ptr[1] & 0x7F;
     size_t header_len = 2;
 
     // Parse extended payload length
-    if (payload_len_raw == 126) {
-        if (data_len < 4) return 0;
+    // Most market data messages are small (< 125 bytes), so expect normal length
+    if (__builtin_expect(payload_len_raw == 126, 0)) {
+        if (__builtin_expect(data_len < 4, 0)) return 0;
         payload_len_raw = (data_ptr[2] << 8) | data_ptr[3];
         header_len = 4;
 
@@ -491,8 +537,8 @@ static int parse_ws_frame_zero_copy(websocket_context_t *ws, size_t available, u
         if (__builtin_expect(payload_len_raw <= 125, 0)) {
             return -1;  // Protocol violation
         }
-    } else if (payload_len_raw == 127) {
-        if (data_len < 10) return 0;
+    } else if (__builtin_expect(payload_len_raw == 127, 0)) {
+        if (__builtin_expect(data_len < 10, 0)) return 0;
         payload_len_raw = ((uint64_t)data_ptr[2] << 56) | ((uint64_t)data_ptr[3] << 48) |
                           ((uint64_t)data_ptr[4] << 40) | ((uint64_t)data_ptr[5] << 32) |
                           ((uint64_t)data_ptr[6] << 24) | ((uint64_t)data_ptr[7] << 16) |
@@ -505,34 +551,47 @@ static int parse_ws_frame_zero_copy(websocket_context_t *ws, size_t available, u
         }
     }
 
-    // Check if complete frame is available
-    if (data_len < header_len + payload_len_raw) return 0;
+    // Check for integer overflow in frame size calculation
+    size_t total_frame_size;
+    if (__builtin_expect(__builtin_add_overflow(header_len, payload_len_raw, &total_frame_size), 0)) {
+        // Overflow: frame size exceeds SIZE_MAX - protocol violation, close connection
+        ws->closed = 1;
+        return -1;
+    }
+
+    // Check if complete frame is available - expect complete frame ready
+    if (__builtin_expect(data_len < total_frame_size, 0)) return 0;
 
     // Return direct pointer to payload (zero-copy)
     *payload_ptr = data_ptr + header_len;
     *payload_len = payload_len_raw;
 
     // Prefetch payload data for large messages
-    if (payload_len_raw > CACHE_LINE_SIZE) {
+    // Market data often exceeds cache line size, so expect prefetch needed
+    if (__builtin_expect(payload_len_raw > CACHE_LINE_SIZE, 1)) {
         __builtin_prefetch(*payload_ptr + CACHE_LINE_SIZE, 0, 2);
-        if (payload_len_raw > 512) {
+        if (__builtin_expect(payload_len_raw > 512, 0)) {
             __builtin_prefetch(*payload_ptr + 256, 0, 1);
             __builtin_prefetch(*payload_ptr + 512, 0, 0);
         }
     }
 
     // Advance ringbuffer past the frame
-    ringbuffer_advance_read(&ws->rx_buffer, header_len + payload_len_raw);
+    ringbuffer_advance_read(&ws->rx_buffer, total_frame_size);
 
-    // Return actual bytes consumed (header + payload) for cache tracking
-    return (int)(header_len + payload_len_raw);
+    // Return actual bytes consumed - check INT_MAX for safe cast
+    if (__builtin_expect(total_frame_size > INT_MAX, 0)) {
+        // Frame exceeds 2GB - very rare, but return INT_MAX to prevent truncation
+        return INT_MAX;
+    }
+    return (int)total_frame_size;
 }
 
 // Process incoming data - zero-copy from SSL to ring buffer
 // HFT simplified: drains SSL, no error handling (fail-fast)
 static inline int process_recv(websocket_context_t *ws) {
-    // Capture NIC arrival timestamp (or start of recv)
-    ws->last_recv_timestamp = os_get_cpu_cycle();
+    // Capture event loop timestamp (start of recv processing)
+    ws->event_timestamp = os_get_cpu_cycle();
 
     uint8_t *write_ptr = NULL;
     size_t write_len = 0;
@@ -544,13 +603,23 @@ static inline int process_recv(websocket_context_t *ws) {
     // we know there's data to read, so do at least one attempt
     do {
         ringbuffer_get_write_ptr(&ws->rx_buffer, &write_ptr, &write_len);
-        if (write_len == 0) break;  // Ringbuffer full
+        if (__builtin_expect(write_len == 0, 0)) break;  // Expect buffer space available
 
         int ret = ssl_read_into(ws->ssl, write_ptr, write_len);
-        if (ret > 0) {
+        if (__builtin_expect(ret > 0, 1)) {  // Expect successful read
             // Capture timestamp after first successful SSL_read (data decrypted and in userspace)
-            if (first_read) {
+            if (__builtin_expect(first_read, 1)) {  // Expect first read
                 ws->ssl_read_complete_timestamp = os_get_cpu_cycle();
+
+#ifdef __linux__
+                // Capture hardware NIC timestamp from BIO storage (if available)
+                if (ws->hw_timestamping_available) {
+                    bio_timestamp_t *bio_ts = ssl_get_timestamp_storage(ws->ssl);
+                    if (bio_ts && bio_ts->hw_timestamp_ns != 0) {
+                        ws->hw_timestamp_ns = bio_ts->hw_timestamp_ns;
+                    }
+                }
+#endif
                 first_read = 0;
             }
             ringbuffer_commit_write(&ws->rx_buffer, ret);
@@ -565,12 +634,15 @@ static inline int process_recv(websocket_context_t *ws) {
 
 // Handle HTTP handshake - simplified
 static inline void handle_http_stage(websocket_context_t *ws) {
-    size_t space_available = sizeof(ws->http_buffer) - ws->http_len;
-    if (space_available == 0) return;  // Buffer full, wait
+    // Reserve 1 byte for null terminator
+    size_t space_available = sizeof(ws->http_buffer) - ws->http_len - 1;
+    if (space_available == 0) return;  // Buffer full (accounting for null terminator)
 
     int ret = ssl_recv(ws->ssl, ws->http_buffer + ws->http_len, space_available);
     if (ret > 0) {
         ws->http_len += ret;
+        // Always null-terminate for safe string operations (strstr, etc.)
+        ws->http_buffer[ws->http_len] = '\0';
         int parse_result = parse_http_response(ws);
         if (parse_result == 1) {
             ws->connected = 1;
@@ -579,7 +651,7 @@ static inline void handle_http_stage(websocket_context_t *ws) {
             // HTTP handshake failed (non-101 response)
             // Print the response for debugging
             const char *debug_env = getenv("WS_DEBUG");
-            if (debug_env && atoi(debug_env) == 1 && ws->http_len > 0) {
+            if (env_is_enabled(debug_env) && ws->http_len > 0) {
                 fprintf(stderr, "WebSocket handshake failed. HTTP response:\n%.*s\n",
                         (int)ws->http_len, ws->http_buffer);
             }
@@ -601,12 +673,24 @@ static inline void send_pong_frame(websocket_context_t *ws, const uint8_t *ping_
         return;
     }
 
-    // PONG frame: FIN=1, opcode=0xA (PONG)
-    uint8_t frame[2 + 125];  // Max control frame size
+    // PONG frame: FIN=1, opcode=0xA (PONG), MASKED (client-to-server)
+    // RFC 6455 Section 5.1: All client-to-server frames MUST be masked
+    uint8_t frame[6 + 125];  // 2-byte header + 4-byte mask + max control payload
     size_t frame_len = 2;
 
-    frame[0] = 0x8A;  // FIN + PONG frame
-    frame[1] = ping_len & 0x7F;  // Payload length (always <= 125 for control frames)
+    frame[0] = 0x8A;  // FIN + PONG opcode
+    frame[1] = 0x80 | (ping_len & 0x7F);  // MASK=1 + payload length
+
+    // Generate unpredictable 4-byte masking key (RFC 6455 requirement)
+    uint32_t mask_word = get_masking_key(ws);
+    uint8_t mask[4];
+    mask[0] = (mask_word >> 0) & 0xFF;
+    mask[1] = (mask_word >> 8) & 0xFF;
+    mask[2] = (mask_word >> 16) & 0xFF;
+    mask[3] = (mask_word >> 24) & 0xFF;
+
+    memcpy(frame + 2, mask, 4);
+    frame_len += 4;
 
     size_t total_size = frame_len + ping_len;
 
@@ -616,11 +700,16 @@ static inline void send_pong_frame(websocket_context_t *ws, const uint8_t *ping_
     ringbuffer_get_write_ptr(&ws->tx_buffer, &write_ptr, &available);
 
     if (available >= total_size) {
-        // Write frame header + payload
+        // Write frame header (includes masking key)
         memcpy(write_ptr, frame, frame_len);
+
+        // Write masked payload (RFC 6455 Section 5.3: XOR with mask)
         if (ping_len > 0) {
-            memcpy(write_ptr + frame_len, ping_payload, ping_len);
+            for (size_t i = 0; i < ping_len; i++) {
+                write_ptr[frame_len + i] = ping_payload[i] ^ mask[i & 3];
+            }
         }
+
         ringbuffer_commit_write(&ws->tx_buffer, total_size);
         ws->has_pending_tx = 1;
 
@@ -642,6 +731,13 @@ static inline void send_close_response(websocket_context_t *ws, const uint8_t *c
 
     // RFC 6455 Section 5.5: Control frames MUST have payload <= 125 bytes
     if (__builtin_expect(close_len > 125, 0)) {
+        ws->closed = 1;
+        return;
+    }
+
+    // RFC 6455 Section 5.5.1: CLOSE status code must be 0 or 2+ bytes (not 1)
+    // 1-byte payload is invalid (status code is always 2 bytes)
+    if (__builtin_expect(close_len == 1, 0)) {
         ws->closed = 1;
         return;
     }
@@ -713,26 +809,34 @@ static inline void handle_ws_stage(websocket_context_t *ws) {
         uint8_t opcode = 0;
 
         int consumed = parse_ws_frame_zero_copy(ws, available, &payload_ptr, &payload_len, &opcode);
-        if (consumed > 0) {
+        if (__builtin_expect(consumed > 0, 1)) {  // Expect successful parse
             // Handle PING frames automatically (RFC 6455: MUST respond with PONG)
-            if (opcode == WS_FRAME_PING) {
+            // Expect TEXT/BINARY data frames, not control frames (rare)
+            if (__builtin_expect(opcode == WS_FRAME_PING, 0)) {
                 send_pong_frame(ws, payload_ptr, payload_len);
             }
 
             // Handle CLOSE frames automatically (RFC 6455 Section 5.5.1: MUST respond with CLOSE)
-            if (opcode == WS_FRAME_CLOSE) {
+            if (__builtin_expect(opcode == WS_FRAME_CLOSE, 0)) {
                 send_close_response(ws, payload_ptr, payload_len);
             }
 
             // Pass all frames to callback (application can see PINGs/PONGs/CLOSEs for monitoring)
-            if (ws->on_msg) {
+            if (__builtin_expect(ws->on_msg != NULL, 1)) {  // Expect callback set
                 ws->on_msg(ws, payload_ptr, payload_len, opcode);
             }
 
             // Update cached available by subtracting consumed bytes
             available -= consumed;
+        } else if (consumed < 0) {
+            // Protocol violation detected - close connection immediately
+            // This prevents infinite re-parse loop of malformed frames
+            ws->connected = 0;
+            ws->closed = 1;
+            if (ws->on_status) ws->on_status(ws, -1);
+            break;
         } else {
-            break;  // No more complete frames
+            break;  // consumed == 0: Incomplete frame, wait for more data
         }
     }
 }
@@ -843,7 +947,12 @@ int ws_send(websocket_context_t *ws, const uint8_t *data, size_t len) {
     memcpy(frame + frame_len, mask, 4);
     frame_len += 4;
 
-    size_t total_size = frame_len + len;
+    // Check for integer overflow in total size calculation
+    size_t total_size;
+    if (__builtin_expect(__builtin_add_overflow(frame_len, len, &total_size), 0)) {
+        // Overflow: message size exceeds SIZE_MAX - invalid length
+        return -1;
+    }
 
     // Zero-copy write: get direct pointer and write in one shot
     uint8_t *write_ptr = NULL;
