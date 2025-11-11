@@ -86,11 +86,18 @@ struct websocket_context {
     size_t http_len;
     int handshake_sent;
 
-    // Latency measurement timestamps
-    uint64_t event_timestamp;              // When event loop received data (TSC cycles)
-    uint64_t ssl_read_complete_timestamp;  // When SSL_read completed (TSC cycles)
+    // Granular latency measurement timestamps (6 stages)
+    // Stage 2: Event loop (epoll_wait returns)
+    uint64_t event_timestamp;              // TSC cycles
+    // Stage 3: Just before SSL_read/recv call
+    uint64_t recv_start_timestamp;         // TSC cycles
+    // Stage 4: SSL_read/recv completes (decryption done)
+    uint64_t recv_end_timestamp;           // TSC cycles
+    // Stage 5: WebSocket frame parsing complete
+    uint64_t frame_parsed_timestamp;       // TSC cycles
 
 #ifdef __linux__
+    // Stage 1: Hardware NIC timestamp (nanoseconds)
     uint64_t hw_timestamp_ns;              // Hardware NIC timestamp in nanoseconds (0 if unavailable)
     int hw_timestamping_available;
 #endif
@@ -152,16 +159,6 @@ static inline uint32_t get_masking_key(websocket_context_t *ws) {
     return ws_prng_next(&ws->prng);
 }
 
-uint64_t ws_get_event_timestamp(websocket_context_t *ws) {
-    if (!ws) return 0;
-    return ws->event_timestamp;
-}
-
-uint64_t ws_get_ssl_read_timestamp(websocket_context_t *ws) {
-    if (!ws) return 0;
-    return ws->ssl_read_complete_timestamp;
-}
-
 uint64_t ws_get_hw_timestamp(websocket_context_t *ws) {
     if (!ws) return 0;
 #ifdef __linux__
@@ -169,6 +166,26 @@ uint64_t ws_get_hw_timestamp(websocket_context_t *ws) {
 #else
     return 0;
 #endif
+}
+
+uint64_t ws_get_event_timestamp(websocket_context_t *ws) {
+    if (!ws) return 0;
+    return ws->event_timestamp;
+}
+
+uint64_t ws_get_recv_start_timestamp(websocket_context_t *ws) {
+    if (!ws) return 0;
+    return ws->recv_start_timestamp;
+}
+
+uint64_t ws_get_recv_end_timestamp(websocket_context_t *ws) {
+    if (!ws) return 0;
+    return ws->recv_end_timestamp;
+}
+
+uint64_t ws_get_frame_parsed_timestamp(websocket_context_t *ws) {
+    if (!ws) return 0;
+    return ws->frame_parsed_timestamp;
 }
 
 int ws_has_hw_timestamping(websocket_context_t *ws) {
@@ -590,13 +607,13 @@ static int parse_ws_frame_zero_copy(websocket_context_t *ws, size_t available, u
 // Process incoming data - zero-copy from SSL to ring buffer
 // HFT simplified: drains SSL, no error handling (fail-fast)
 static inline int process_recv(websocket_context_t *ws) {
-    // Capture event loop timestamp (start of recv processing)
+    // Stage 2: Capture event loop timestamp (epoll_wait returned)
     ws->event_timestamp = os_get_cpu_cycle();
 
     uint8_t *write_ptr = NULL;
     size_t write_len = 0;
     int total_read = 0;
-    int first_read = 1;  // Track first successful read to capture SSL completion time
+    int first_read = 1;  // Track first read to capture recv start/end timestamps
 
     // Optimization: Use do-while to save one ssl_pending() call
     // Since we're called when event notifier reports data available,
@@ -605,14 +622,19 @@ static inline int process_recv(websocket_context_t *ws) {
         ringbuffer_get_write_ptr(&ws->rx_buffer, &write_ptr, &write_len);
         if (__builtin_expect(write_len == 0, 0)) break;  // Expect buffer space available
 
+        // Stage 3: Capture timestamp just before SSL_read call (only on first read)
+        if (__builtin_expect(first_read, 1)) {
+            ws->recv_start_timestamp = os_get_cpu_cycle();
+        }
+
         int ret = ssl_read_into(ws->ssl, write_ptr, write_len);
         if (__builtin_expect(ret > 0, 1)) {  // Expect successful read
-            // Capture timestamp after first successful SSL_read (data decrypted and in userspace)
+            // Stage 4: Capture timestamp after first successful SSL_read (data decrypted)
             if (__builtin_expect(first_read, 1)) {  // Expect first read
-                ws->ssl_read_complete_timestamp = os_get_cpu_cycle();
+                ws->recv_end_timestamp = os_get_cpu_cycle();
 
 #ifdef __linux__
-                // Capture hardware NIC timestamp from BIO storage (if available)
+                // Stage 1: Capture hardware NIC timestamp from BIO storage (if available)
                 if (ws->hw_timestamping_available) {
                     bio_timestamp_t *bio_ts = ssl_get_timestamp_storage(ws->ssl);
                     if (bio_ts && bio_ts->hw_timestamp_ns != 0) {
@@ -803,6 +825,7 @@ static inline void handle_ws_stage(websocket_context_t *ws) {
     size_t available = ringbuffer_available_read(&ws->rx_buffer);
 
     // Parse frames zero-copy
+    int first_frame = 1;  // Track first frame to capture parsed timestamp
     while (available >= 2) {
         uint8_t *payload_ptr = NULL;
         size_t payload_len = 0;
@@ -810,6 +833,12 @@ static inline void handle_ws_stage(websocket_context_t *ws) {
 
         int consumed = parse_ws_frame_zero_copy(ws, available, &payload_ptr, &payload_len, &opcode);
         if (__builtin_expect(consumed > 0, 1)) {  // Expect successful parse
+            // Stage 5: Capture timestamp after first frame parsing completes
+            if (__builtin_expect(first_frame, 1)) {
+                ws->frame_parsed_timestamp = os_get_cpu_cycle();
+                first_frame = 0;
+            }
+
             // Handle PING frames automatically (RFC 6455: MUST respond with PONG)
             // Expect TEXT/BINARY data frames, not control frames (rare)
             if (__builtin_expect(opcode == WS_FRAME_PING, 0)) {
@@ -822,6 +851,7 @@ static inline void handle_ws_stage(websocket_context_t *ws) {
             }
 
             // Pass all frames to callback (application can see PINGs/PONGs/CLOSEs for monitoring)
+            // Stage 6: Application callback invoked (timestamp captured by application)
             if (__builtin_expect(ws->on_msg != NULL, 1)) {  // Expect callback set
                 ws->on_msg(ws, payload_ptr, payload_len, opcode);
             }

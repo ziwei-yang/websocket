@@ -5,20 +5,25 @@
 Benchmark results on Intel i9-12900 with Linux kernel kTLS (OpenSSL backend):
 
 ```
-📊 Latency Breakdown (Mean):
-   NIC→SSL (decryption):       75839 ticks (  31349.00 ns)  [96.9%]
-   SSL→APP (processing):        2440 ticks (   1008.00 ns)  [3.1%]
-   ────────────────────────────────────────────────
-   Total (NIC→APP):            78279 ticks (  32358.00 ns)  [100.0%]
+📊 Latency Breakdown (Mean) - 6 Stages:
+   Stage 2: EVENT→RECV_START (prep):            271 ticks (  111.00 ns)  [  0.4%]
+   Stage 3: RECV_START→END (SSL decrypt):     72529 ticks (29981.00 ns)  [ 96.6%]
+   Stage 4: RECV_END→PARSED (WS parse):         366 ticks (  151.00 ns)  [  0.5%]
+   Stage 5: PARSED→CALLBACK (app setup):       1901 ticks (  785.00 ns)  [  2.5%]
+   ────────────────────────────────────────────────────────────
+   Total (EVENT→CALLBACK):                    75067 ticks (31030.00 ns)  [100.0%]
 ```
 
 **Key Insights:**
-- **Total latency**: ~32 μs from NIC to application callback
-- **SSL decryption**: ~31 μs (96.9% of total) - handled by kernel via kTLS
-- **Library overhead**: ~1 μs (3.1% of total) - WebSocket parsing + frame handling
+- **Total latency**: ~31 μs from event notification to application callback
+- **SSL decryption**: ~30 μs (96.6% of total) - handled by kernel via kTLS
+- **Library overhead**: ~1 μs (3.4% of total) - WebSocket parsing + frame handling + setup
+  - Event preparation: ~111 ns (0.4%)
+  - WebSocket parsing: ~151 ns (0.5%)
+  - Application setup: ~785 ns (2.5%)
 - **Platform**: Intel i9-12900, TSC frequency ~2.42 GHz
 
-This demonstrates the library's minimal processing overhead (~1 μs) with most latency attributed to SSL/TLS decryption, which is efficiently handled by the Linux kernel through kTLS offload.
+This demonstrates the library's minimal processing overhead (~1 μs) with most latency attributed to SSL/TLS decryption, which is efficiently handled by the Linux kernel through kTLS offload. The granular 6-stage breakdown provides precise visibility into where every microsecond is spent.
 
 ### Core Performance
 - **Ultra-low latency**: Optimized for high-frequency trading use cases (~40-180 μs median processing latency)

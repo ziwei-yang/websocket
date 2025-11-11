@@ -479,9 +479,17 @@ ktls-benchmark:
 	@echo "To analyze results:"
 	@echo "  diff /tmp/openssl_results.txt /tmp/ktls_results.txt"
 
+# Diagnose kTLS system configuration
+diagnose-ktls:
+	@echo "Building kTLS diagnostic tool..."
+	@$(CC) $(CFLAGS) $(INCLUDES) -o tools/diagnose_ktls tools/diagnose_ktls.c
+	@echo ""
+	@./tools/diagnose_ktls
+	@echo ""
+
 # Clean build artifacts and PGO profiling data
 clean:
-	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(BITGET_TEST_EXE) $(SSL_BENCHMARK_EXE) $(TIMING_TEST_EXE) $(KTLS_TEST_EXE) $(EXAMPLE_EXE) $(SSL_PROBE_EXE)
+	rm -rf $(OBJDIR) $(LIBRARY) $(TEST_EXE) $(SSL_TEST_EXE) $(WS_TEST_EXE) $(INTEGRATION_TEST_EXE) $(BITGET_TEST_EXE) $(SSL_BENCHMARK_EXE) $(TIMING_TEST_EXE) $(KTLS_TEST_EXE) $(EXAMPLE_EXE) $(SSL_PROBE_EXE) tools/diagnose_ktls
 	rm -f *.profraw *.profdata default.profdata default*.profraw
 
 # Debug build

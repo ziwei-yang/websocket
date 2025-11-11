@@ -46,18 +46,39 @@ void ws_close(websocket_context_t *ws);
 // Get connection state
 ws_state_t ws_get_state(websocket_context_t *ws);
 
-// Get timestamp when event loop received data (start of recv, measured with TSC)
-// Use this to measure event-to-callback latency
-uint64_t ws_get_event_timestamp(websocket_context_t *ws);
+// Granular timestamp collection (6 stages for detailed latency breakdown)
+// All timestamps use TSC cycles (os_get_cpu_cycle) except hw_timestamp which uses nanoseconds
+//
+// Typical latency flow:
+//   1. HW NIC timestamp (ns)     - Packet arrival at network card
+//   2. Event timestamp (cycles)   - epoll_wait/event loop returns with EPOLLIN
+//   3. Recv start (cycles)        - About to call SSL_read/recv
+//   4. Recv end (cycles)          - SSL_read/recv completes (decryption done)
+//   5. Frame parsed (cycles)      - WebSocket frame parsing complete
+//   6. Callback invoked           - Application on_msg callback called
+//
+// Use os_cycles_to_ns() to convert cycle timestamps to nanoseconds
 
-// Get timestamp when SSL_read completed (data decrypted and in userspace)
-// Use this to measure SSL decryption time separately from application processing
-uint64_t ws_get_ssl_read_timestamp(websocket_context_t *ws);
-
-// Get hardware NIC timestamp (Linux only, returns 0 if not available)
+// Stage 1: Get hardware NIC timestamp (Linux only, returns 0 if not available)
 // Timestamp in nanoseconds from hardware network card
 // Use this to measure true NIC-to-application latency
 uint64_t ws_get_hw_timestamp(websocket_context_t *ws);
+
+// Stage 2: Get timestamp when event loop received data (epoll_wait returns)
+// Measured with TSC cycles - use os_cycles_to_ns() to convert
+uint64_t ws_get_event_timestamp(websocket_context_t *ws);
+
+// Stage 3: Get timestamp just before SSL_read/recv call starts
+// Measured with TSC cycles - use os_cycles_to_ns() to convert
+uint64_t ws_get_recv_start_timestamp(websocket_context_t *ws);
+
+// Stage 4: Get timestamp when SSL_read/recv completed (data decrypted)
+// Measured with TSC cycles - use os_cycles_to_ns() to convert
+uint64_t ws_get_recv_end_timestamp(websocket_context_t *ws);
+
+// Stage 5: Get timestamp when WebSocket frame parsing completed
+// Measured with TSC cycles - use os_cycles_to_ns() to convert
+uint64_t ws_get_frame_parsed_timestamp(websocket_context_t *ws);
 
 // Check if hardware timestamping is available (Linux only)
 int ws_has_hw_timestamping(websocket_context_t *ws);

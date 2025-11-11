@@ -62,4 +62,66 @@ uint64_t os_get_cpu_cycle(void);
 // Note: Uses prewarmed calibration data for zero-branch hot-path performance
 double os_cycles_to_ns(uint64_t cycles);
 
+// Inline performance utilities for hot-path optimization
+//
+// These inline functions provide low-level performance hints and intrinsics
+// for use in performance-critical code paths. Inspired by websocket_766 implementation.
+
+// Direct RDTSC instruction for x86 (alternative to os_get_cpu_cycle for maximum performance)
+// Returns: CPU timestamp counter value
+// Note: May be out-of-order on some CPUs - use RDTSCP or barriers if strict ordering needed
+static inline uint64_t os_rdtsc(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    uint32_t lo, hi;
+    __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+#elif defined(__aarch64__) || defined(__ARM_ARCH_8A__)
+    // ARM64: Use virtual counter (similar to TSC)
+    uint64_t val;
+    __asm__ __volatile__ ("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+#else
+    // Fallback to os_get_cpu_cycle()
+    return os_get_cpu_cycle();
+#endif
+}
+
+// Prefetch memory into cache (hint to CPU)
+// ptr: Pointer to memory address to prefetch
+// Note: This is a hint - CPU may ignore it. Most useful when access pattern is predictable
+static inline void os_prefetch(const void *ptr) {
+    __builtin_prefetch(ptr, 0, 3);  // Read access, high temporal locality
+}
+
+// Prefetch for write (useful before modifying data)
+// ptr: Pointer to memory address to prefetch
+static inline void os_prefetch_write(const void *ptr) {
+    __builtin_prefetch(ptr, 1, 3);  // Write access, high temporal locality
+}
+
+// Memory barrier - ensures all memory operations complete before continuing
+// Use when ordering of memory operations matters (e.g., inter-thread communication)
+static inline void os_memory_barrier(void) {
+    __sync_synchronize();
+}
+
+// Compiler barrier - prevents compiler reordering (no CPU barrier)
+// Use when you need to prevent compiler optimization from reordering operations
+static inline void os_compiler_barrier(void) {
+    __asm__ __volatile__ ("" ::: "memory");
+}
+
+// Pause/yield hint for spin-wait loops
+// Improves performance and reduces power consumption in busy-wait scenarios
+static inline void os_pause(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__ ("pause");
+#elif defined(__aarch64__) || defined(__ARM_ARCH_8A__)
+    __asm__ __volatile__ ("yield");
+#else
+    // Fallback: no-op
+    os_compiler_barrier();
+#endif
+}
+
 #endif // OS_H

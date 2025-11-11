@@ -19,10 +19,12 @@
 
 // Timing record for each message - pre-allocated to avoid I/O during measurement
 typedef struct {
-    uint64_t hw_timestamp_ns;  // NIC hardware timestamp in nanoseconds (if available)
-    uint64_t event_cycle;      // When event loop received data (TSC cycles)
-    uint64_t ssl_read_cycle;   // When SSL_read completed (TSC cycles)
-    uint64_t callback_cycle;   // When callback was invoked (TSC cycles)
+    uint64_t hw_timestamp_ns;    // Stage 1: NIC hardware timestamp in nanoseconds (if available)
+    uint64_t event_cycle;        // Stage 2: When event loop received data (TSC cycles)
+    uint64_t recv_start_cycle;   // Stage 3: Before SSL_read/recv call (TSC cycles)
+    uint64_t recv_end_cycle;     // Stage 4: When SSL_read/recv completed (TSC cycles)
+    uint64_t frame_parsed_cycle; // Stage 5: When frame parsing completed (TSC cycles)
+    uint64_t callback_cycle;     // Stage 6: When callback was invoked (TSC cycles)
     size_t payload_len;
     uint8_t opcode;
 } timing_record_t;
@@ -50,15 +52,19 @@ void on_message(websocket_context_t *ws, const uint8_t *payload_ptr, size_t payl
     // CRITICAL: Capture callback timestamp FIRST - minimize operations before this
     uint64_t callback_cycle = os_get_cpu_cycle();
 
-    // Get timestamps for latency breakdown analysis
-    uint64_t event_cycle = ws_get_event_timestamp(ws);        // Event loop received data
-    uint64_t ssl_read_cycle = ws_get_ssl_read_timestamp(ws);  // SSL_read completed
+    // Get all timestamps for granular latency breakdown (6 stages)
+    uint64_t event_cycle = ws_get_event_timestamp(ws);              // Stage 2: Epoll/event loop
+    uint64_t recv_start_cycle = ws_get_recv_start_timestamp(ws);    // Stage 3: Before SSL_read
+    uint64_t recv_end_cycle = ws_get_recv_end_timestamp(ws);        // Stage 4: After SSL_read
+    uint64_t frame_parsed_cycle = ws_get_frame_parsed_timestamp(ws); // Stage 5: After frame parse
 
     // Store timing data - NO I/O operations in hot path!
     timing_record_t *record = &timing_records[message_count];
     record->callback_cycle = callback_cycle;
     record->event_cycle = event_cycle;
-    record->ssl_read_cycle = ssl_read_cycle;
+    record->recv_start_cycle = recv_start_cycle;
+    record->recv_end_cycle = recv_end_cycle;
+    record->frame_parsed_cycle = frame_parsed_cycle;
     record->payload_len = payload_len;
     record->opcode = opcode;
 
@@ -161,42 +167,51 @@ static void print_run_statistics(int run_index) {
     printf("Run %d/%d — warmup %d messages, analyzing next %d messages\n",
            run_index + 1, NUM_RUNS, WARMUP_MESSAGES, STATS_MESSAGES);
 
-    // Allocate buffers for latency metrics
-    uint64_t *total_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t));  // EVENT→APP (or HW→APP if HW timestamps available)
-    uint64_t *hw_event_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t)); // HW→EVENT (only if HW timestamps available)
-    uint64_t *event_ssl_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t)); // EVENT→SSL
-    uint64_t *ssl_app_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t)); // SSL→APP
+    // Allocate buffers for all 6 latency stages
+    uint64_t *total_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t));         // Total: EVENT→CALLBACK
+    uint64_t *hw_event_latencies = (uint64_t *)malloc(stats_count * sizeof(uint64_t));      // Stage 1: HW→EVENT (ns)
+    uint64_t *event_recv_start = (uint64_t *)malloc(stats_count * sizeof(uint64_t));        // Stage 2: EVENT→RECV_START
+    uint64_t *recv_start_end = (uint64_t *)malloc(stats_count * sizeof(uint64_t));          // Stage 3: RECV_START→RECV_END (SSL decrypt)
+    uint64_t *recv_end_parsed = (uint64_t *)malloc(stats_count * sizeof(uint64_t));         // Stage 4: RECV_END→FRAME_PARSED
+    uint64_t *parsed_callback = (uint64_t *)malloc(stats_count * sizeof(uint64_t));         // Stage 5: FRAME_PARSED→CALLBACK
 
-    if (!total_latencies || !hw_event_latencies || !event_ssl_latencies || !ssl_app_latencies) {
+    if (!total_latencies || !hw_event_latencies || !event_recv_start ||
+        !recv_start_end || !recv_end_parsed || !parsed_callback) {
         fprintf(stderr, "Failed to allocate latency buffers for run %d\n", run_index + 1);
         free(total_latencies);
         free(hw_event_latencies);
-        free(event_ssl_latencies);
-        free(ssl_app_latencies);
+        free(event_recv_start);
+        free(recv_start_end);
+        free(recv_end_parsed);
+        free(parsed_callback);
         return;
     }
 
-    // Calculate latency components
+    // Calculate all 6 latency stages
     for (int i = 0; i < stats_count; i++) {
         int idx = stats_start + i;
-        total_latencies[i] = timing_records[idx].callback_cycle - timing_records[idx].event_cycle;
-        event_ssl_latencies[i] = timing_records[idx].ssl_read_cycle - timing_records[idx].event_cycle;
-        ssl_app_latencies[i] = timing_records[idx].callback_cycle - timing_records[idx].ssl_read_cycle;
 
-        // HW→EVENT latency (only valid if HW timestamp available)
-        // Note: Both timestamps are now relative to their baselines
+        // Total latency
+        total_latencies[i] = timing_records[idx].callback_cycle - timing_records[idx].event_cycle;
+
+        // Stage 2: EVENT → RECV_START (epoll to start of SSL_read)
+        event_recv_start[i] = timing_records[idx].recv_start_cycle - timing_records[idx].event_cycle;
+
+        // Stage 3: RECV_START → RECV_END (SSL decryption time)
+        recv_start_end[i] = timing_records[idx].recv_end_cycle - timing_records[idx].recv_start_cycle;
+
+        // Stage 4: RECV_END → FRAME_PARSED (WebSocket frame parsing)
+        recv_end_parsed[i] = timing_records[idx].frame_parsed_cycle - timing_records[idx].recv_end_cycle;
+
+        // Stage 5: FRAME_PARSED → CALLBACK (application processing setup)
+        parsed_callback[i] = timing_records[idx].callback_cycle - timing_records[idx].frame_parsed_cycle;
+
+        // Stage 1: HW→EVENT latency (only valid if HW timestamp available)
         if (hw_timestamping_available && timing_records[idx].hw_timestamp_ns != 0 && event_timestamp_baseline_ns != 0) {
-            // Convert EVENT timestamp from TSC cycles to nanoseconds (relative to baseline)
             double event_ns_absolute = cycles_to_nanoseconds(timing_records[idx].event_cycle);
             double event_ns_relative = event_ns_absolute - event_timestamp_baseline_ns;
-
-            // HW timestamp is already relative to baseline
             double hw_ns_relative = (double)timing_records[idx].hw_timestamp_ns;
-
-            // Calculate HW→EVENT latency (both are now relative, so subtraction works)
             double hw_event_ns = event_ns_relative - hw_ns_relative;
-
-            // Store as nanoseconds (not cycles) for display
             hw_event_latencies[i] = (hw_event_ns >= 0) ? (uint64_t)hw_event_ns : 0;
         } else {
             hw_event_latencies[i] = 0;
@@ -289,12 +304,14 @@ static void print_run_statistics(int run_index) {
         }
     }
 
-    // Display latency breakdown
-    printf("\n📊 Latency Breakdown (Mean):\n");
+    // Display granular 6-stage latency breakdown
+    printf("\n📊 Latency Breakdown (Mean) - 6 Stages:\n");
 
     if (hw_timestamping_available) {
-        // Calculate means for all three stages
-        double mean_hw_event = 0.0, mean_event_ssl = 0.0, mean_ssl_app = 0.0;
+        // Calculate means for all 6 stages (with HW timestamps)
+        double mean_hw_event = 0.0;
+        double mean_event_recv = 0.0, mean_recv_decrypt = 0.0;
+        double mean_decrypt_parse = 0.0, mean_parse_callback = 0.0;
         int valid_hw_count = 0;
 
         for (int i = 0; i < stats_count; i++) {
@@ -302,50 +319,77 @@ static void print_run_statistics(int run_index) {
                 mean_hw_event += (double)hw_event_latencies[i];
                 valid_hw_count++;
             }
-            mean_event_ssl += (double)event_ssl_latencies[i];
-            mean_ssl_app += (double)ssl_app_latencies[i];
+            mean_event_recv += (double)event_recv_start[i];
+            mean_recv_decrypt += (double)recv_start_end[i];
+            mean_decrypt_parse += (double)recv_end_parsed[i];
+            mean_parse_callback += (double)parsed_callback[i];
         }
 
         if (valid_hw_count > 0) {
             mean_hw_event /= valid_hw_count;
-            mean_event_ssl /= stats_count;
-            mean_ssl_app /= stats_count;
+            mean_event_recv /= stats_count;
+            mean_recv_decrypt /= stats_count;
+            mean_decrypt_parse /= stats_count;
+            mean_parse_callback /= stats_count;
 
-            // Note: mean_hw_event is already in nanoseconds
-            printf("   HW→EVENT (kernel):         %10.0f ns  [%.1f%%]\n",
-                   mean_hw_event,
-                   100.0 * mean_hw_event / (mean_hw_event + cycles_to_nanoseconds((uint64_t)mean_event_ssl) + cycles_to_nanoseconds((uint64_t)mean_ssl_app)));
-            printf("   EVENT→SSL (decryption):    %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
-                   mean_event_ssl, cycles_to_nanoseconds((uint64_t)mean_event_ssl),
-                   100.0 * cycles_to_nanoseconds((uint64_t)mean_event_ssl) / (mean_hw_event + cycles_to_nanoseconds((uint64_t)mean_event_ssl) + cycles_to_nanoseconds((uint64_t)mean_ssl_app)));
-            printf("   SSL→APP (processing):      %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
-                   mean_ssl_app, cycles_to_nanoseconds((uint64_t)mean_ssl_app),
-                   100.0 * cycles_to_nanoseconds((uint64_t)mean_ssl_app) / (mean_hw_event + cycles_to_nanoseconds((uint64_t)mean_event_ssl) + cycles_to_nanoseconds((uint64_t)mean_ssl_app)));
-            printf("   ────────────────────────────────────────────────\n");
-            printf("   Total (HW→APP):            %10.2f ns  [100.0%%]\n",
-                   mean_hw_event + cycles_to_nanoseconds((uint64_t)mean_event_ssl) + cycles_to_nanoseconds((uint64_t)mean_ssl_app));
+            double total_ns = mean_hw_event +
+                             cycles_to_nanoseconds((uint64_t)mean_event_recv) +
+                             cycles_to_nanoseconds((uint64_t)mean_recv_decrypt) +
+                             cycles_to_nanoseconds((uint64_t)mean_decrypt_parse) +
+                             cycles_to_nanoseconds((uint64_t)mean_parse_callback);
+
+            printf("   Stage 1: HW→EVENT (kernel):           %10.0f ns  [%5.1f%%]\n",
+                   mean_hw_event, 100.0 * mean_hw_event / total_ns);
+            printf("   Stage 2: EVENT→RECV_START (prep):     %10.0f ticks (%8.2f ns)  [%5.1f%%]\n",
+                   mean_event_recv, cycles_to_nanoseconds((uint64_t)mean_event_recv),
+                   100.0 * cycles_to_nanoseconds((uint64_t)mean_event_recv) / total_ns);
+            printf("   Stage 3: RECV_START→END (SSL decrypt): %10.0f ticks (%8.2f ns)  [%5.1f%%]\n",
+                   mean_recv_decrypt, cycles_to_nanoseconds((uint64_t)mean_recv_decrypt),
+                   100.0 * cycles_to_nanoseconds((uint64_t)mean_recv_decrypt) / total_ns);
+            printf("   Stage 4: RECV_END→PARSED (WS parse):   %10.0f ticks (%8.2f ns)  [%5.1f%%]\n",
+                   mean_decrypt_parse, cycles_to_nanoseconds((uint64_t)mean_decrypt_parse),
+                   100.0 * cycles_to_nanoseconds((uint64_t)mean_decrypt_parse) / total_ns);
+            printf("   Stage 5: PARSED→CALLBACK (app setup):  %10.0f ticks (%8.2f ns)  [%5.1f%%]\n",
+                   mean_parse_callback, cycles_to_nanoseconds((uint64_t)mean_parse_callback),
+                   100.0 * cycles_to_nanoseconds((uint64_t)mean_parse_callback) / total_ns);
+            printf("   ────────────────────────────────────────────────────────────\n");
+            printf("   Total (HW→CALLBACK):                  %10.2f ns  [100.0%%]\n", total_ns);
         } else {
             printf("   ⚠️  No valid hardware timestamps captured\n");
         }
     } else {
-        // Without hardware timestamps, show EVENT→SSL and SSL→APP only
-        double mean_event_ssl = 0.0, mean_ssl_app = 0.0;
-        for (int i = 0; i < stats_count; i++) {
-            mean_event_ssl += (double)event_ssl_latencies[i];
-            mean_ssl_app += (double)ssl_app_latencies[i];
-        }
-        mean_event_ssl /= stats_count;
-        mean_ssl_app /= stats_count;
+        // Without hardware timestamps, show 5 stages (EVENT onwards)
+        double mean_event_recv = 0.0, mean_recv_decrypt = 0.0;
+        double mean_decrypt_parse = 0.0, mean_parse_callback = 0.0;
 
-        printf("   EVENT→SSL (decryption):    %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
-               mean_event_ssl, cycles_to_nanoseconds((uint64_t)mean_event_ssl),
-               100.0 * mean_event_ssl / avg_latency);
-        printf("   SSL→APP (processing):      %10.0f ticks (%10.2f ns)  [%.1f%%]\n",
-               mean_ssl_app, cycles_to_nanoseconds((uint64_t)mean_ssl_app),
-               100.0 * mean_ssl_app / avg_latency);
-        printf("   ────────────────────────────────────────────────\n");
-        printf("   Total (EVENT→APP):         %10.0f ticks (%10.2f ns)  [100.0%%]\n",
-               avg_latency, cycles_to_nanoseconds((uint64_t)avg_latency));
+        for (int i = 0; i < stats_count; i++) {
+            mean_event_recv += (double)event_recv_start[i];
+            mean_recv_decrypt += (double)recv_start_end[i];
+            mean_decrypt_parse += (double)recv_end_parsed[i];
+            mean_parse_callback += (double)parsed_callback[i];
+        }
+        mean_event_recv /= stats_count;
+        mean_recv_decrypt /= stats_count;
+        mean_decrypt_parse /= stats_count;
+        mean_parse_callback /= stats_count;
+
+        double total_cycles = mean_event_recv + mean_recv_decrypt + mean_decrypt_parse + mean_parse_callback;
+
+        printf("   Stage 2: EVENT→RECV_START (prep):     %10.0f ticks (%8.2f ns)  [%5.1f%%]\n",
+               mean_event_recv, cycles_to_nanoseconds((uint64_t)mean_event_recv),
+               100.0 * mean_event_recv / total_cycles);
+        printf("   Stage 3: RECV_START→END (SSL decrypt): %10.0f ticks (%8.2f ns)  [%5.1f%%]\n",
+               mean_recv_decrypt, cycles_to_nanoseconds((uint64_t)mean_recv_decrypt),
+               100.0 * mean_recv_decrypt / total_cycles);
+        printf("   Stage 4: RECV_END→PARSED (WS parse):   %10.0f ticks (%8.2f ns)  [%5.1f%%]\n",
+               mean_decrypt_parse, cycles_to_nanoseconds((uint64_t)mean_decrypt_parse),
+               100.0 * mean_decrypt_parse / total_cycles);
+        printf("   Stage 5: PARSED→CALLBACK (app setup):  %10.0f ticks (%8.2f ns)  [%5.1f%%]\n",
+               mean_parse_callback, cycles_to_nanoseconds((uint64_t)mean_parse_callback),
+               100.0 * mean_parse_callback / total_cycles);
+        printf("   ────────────────────────────────────────────────────────────\n");
+        printf("   Total (EVENT→CALLBACK):               %10.0f ticks (%8.2f ns)  [100.0%%]\n",
+               total_cycles, cycles_to_nanoseconds((uint64_t)total_cycles));
     }
 
     // Flush output immediately for real-time visibility
@@ -354,8 +398,10 @@ static void print_run_statistics(int run_index) {
     free(sorted);
     free(total_latencies);
     free(hw_event_latencies);
-    free(event_ssl_latencies);
-    free(ssl_app_latencies);
+    free(event_recv_start);
+    free(recv_start_end);
+    free(recv_end_parsed);
+    free(parsed_callback);
 }
 
 static void flush_ready_runs(void) {
